@@ -32,7 +32,11 @@ for alias in $aliases; do
     unread=$(printf '%s' "$count_line" | awk '{for (i=1;i<=NF;i++) if ($i=="unread") {print $(i-1); exit}}')
     [ -z "$unread" ] && unread=0
 
-    state_file="$state_dir/$alias.last_unread"
+    # Sanitize the alias for use as a filename. Rig-scoped aliases like
+    # "dv-gascity-utils/gastown.furiosa" contain "/" which bash treats as
+    # a directory separator — replacing with "__" keeps the state file flat.
+    safe_alias=${alias//\//__}
+    state_file="$state_dir/$safe_alias.last_unread"
     prev=0
     [ -f "$state_file" ] && prev=$(cat "$state_file")
 
@@ -45,5 +49,5 @@ for alias in $aliases; do
             --delivery wait-idle >/dev/null 2>&1 || true
     fi
 
-    printf '%s\n' "$unread" > "$state_file"
+    printf '%s\n' "$unread" > "$state_file" || true
 done
