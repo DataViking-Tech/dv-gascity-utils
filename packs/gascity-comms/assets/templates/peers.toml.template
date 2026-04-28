@@ -1,0 +1,19 @@
+# Peer registry for cross-city Gas City addressing.
+#
+# Each entry maps a city name to its gateway URL and a path to the bearer
+# token used to authenticate. Used by `gcx` to route mail / sling / status
+# calls to remote supervisors.
+#
+# Typical setup: list every city this host should be able to reach, including
+# cities managed locally (so the same code path is exercised everywhere).
+#
+# Example:
+#
+#   [peers.yggdrasil]
+#   url = "http://100.121.222.11:8472"
+#   token_file = "/Users/<you>/.gc/tokens/yggdrasil-gateway.token"
+#   local_path = "/Users/<you>/yggdrasil"   # optional; informational
+#
+#   [peers.midgard]
+#   url = "http://100.124.163.125:8472"
+#   token_file = "/Users/<you>/.gc/tokens/midgard-gateway.token"

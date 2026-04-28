@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""
+gcx — cross-city Gas City wrapper.
+
+Routes city-qualified addresses through the right peer's gateway:
+    <city>:<alias>   point-to-point send/read
+    @<city>          city-scoped browse (broadcast inbox listing)
+
+Falls through to plain `gc` for non-cross-city calls.
+
+Outgoing wisps are stamped with origin-city metadata so replies can
+round-trip via `gcx mail reply <id>`.
+
+Per-host config:
+    ~/.gc/peers.toml  — peer registry (url + token_file per city)
+    ~/.gc/tokens/*    — bearer tokens, mode 0600
+
+Usage:
+    gcx mail send <city>:<alias> -s <subject> -m <body>
+    gcx mail reply <wisp-id> -m <body>
+    gcx mail inbox @<city> [<alias>]
+    gcx mail read <city>:<wisp-id>
+    gcx cities
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+PEERS_PATH = Path(os.environ.get("GC_PEERS_FILE", str(Path.home() / ".gc" / "peers.toml")))
+
+
+def _local_city() -> str | None:
+    """Best-effort: which city is this host's primary identity?
+
+    Read from $GC_CITY_NAME if set (gc sets this for spawned sessions),
+    otherwise fall back to the workspace_name in the city's site.toml.
+    """
+    name = os.environ.get("GC_CITY_NAME")
+    if name:
+        return name
+    city_path = os.environ.get("GC_CITY_PATH")
+    if city_path:
+        site = Path(city_path) / ".gc" / "site.toml"
+        if site.exists():
+            for line in site.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("workspace_name") and "=" in line:
+                    return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def _local_alias() -> str | None:
+    """Best-effort: which session/agent is invoking gcx?"""
+    return os.environ.get("GC_ALIAS") or os.environ.get("GC_SESSION_NAME") or os.environ.get("GC_AGENT")
+
+
+def load_peers() -> dict:
+    """Parse the small subset of TOML used by peers.toml.
+
+    Supports `[peers.<name>]` tables containing string keys with
+    double-quoted values. Avoids a third-party dependency.
+    """
+    if not PEERS_PATH.exists():
+        return {}
+    peers: dict[str, dict] = {}
+    current: dict | None = None
+    for raw in PEERS_PATH.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[peers.") and line.endswith("]"):
+            name = line[len("[peers.") : -1].strip()
+            current = {}
+            peers[name] = current
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = None
+            continue
+        if current is None or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip('"')
+        current[key.strip()] = value
+    return peers
+
+
+def split_address(addr: str) -> tuple[str | None, str]:
+    """Parse '<city>:<alias>' or '@<city>' or plain '<alias>'."""
+    if addr.startswith("@"):
+        return addr[1:], ""
+    if ":" in addr:
+        city, _, alias = addr.partition(":")
+        return city, alias
+    return None, addr
+
+
+def read_token(token_file: str) -> str:
+    return Path(token_file).expanduser().read_text().strip()
+
+
+def api_call(peer: dict, method: str, path: str, body: dict | None = None) -> dict:
+    url = peer["url"].rstrip("/") + path
+    headers = {
+        "Authorization": f"Bearer {read_token(peer['token_file'])}",
+    }
+    if method != "GET":
+        headers["X-GC-Request"] = "1"
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        sys.stderr.write(f"HTTP {e.code} {url}: {body_text}\n")
+        sys.exit(1)
+
+
+ORIGIN_HEADER = "X-Gascity-Origin"
+
+
+def _mail_body(to: str, subject: str, message: str, *, origin: dict | None = None) -> dict:
+    body: dict = {"to": to}
+    if subject:
+        body["subject"] = subject
+    if origin:
+        # Prepend an RFC822-style header line. The mail API doesn't accept a
+        # `metadata` field, so origin info travels in-band at the top of the
+        # body. `gcx mail read` strips this; plain `gc mail read` shows it.
+        header = f"{ORIGIN_HEADER}: {origin['city']}:{origin.get('alias','?')}\n\n"
+        message = header + (message or "")
+    if message:
+        body["body"] = message
+    return body
+
+
+def _parse_origin_header(body_text: str) -> tuple[dict | None, str]:
+    """Pull the X-Gascity-Origin header out of the body if present.
+
+    Returns (origin_dict_or_None, body_with_header_stripped).
+    """
+    if not body_text or not body_text.startswith(ORIGIN_HEADER + ":"):
+        return None, body_text or ""
+    first_line, _, rest = body_text.partition("\n")
+    value = first_line.split(":", 1)[1].strip()
+    city, _, alias = value.partition(":")
+    rest = rest.lstrip("\n")
+    return {"city": city, "alias": alias or "?"}, rest
+
+
+def cmd_mail_send(args):
+    peers = load_peers()
+    city, alias = split_address(args.to)
+    if city is None or city not in peers:
+        # Fall through to local CLI.
+        passthrough = ["gc", "mail", "send", args.to]
+        if args.subject:
+            passthrough += ["-s", args.subject]
+        if args.message:
+            passthrough += ["-m", args.message]
+        os.execvp("gc", passthrough)
+    origin = None
+    home = _local_city()
+    if home and home != city:
+        origin = {"city": home, "alias": _local_alias() or "unknown"}
+    body = _mail_body(alias, args.subject, args.message, origin=origin)
+    resp = api_call(peers[city], "POST", f"/v0/city/{city}/mail", body=body)
+    sys.stdout.write(f"Sent {resp.get('id', '?')} to {city}:{alias}\n")
+
+
+def cmd_mail_reply(args):
+    """Reply to a wisp; if the wisp carries origin metadata, route the
+    reply back to the origin city instead of replying locally."""
+    peers = load_peers()
+    wisp_id = args.id
+    src_city, _, _ = wisp_id.partition("-")
+    src_peer = peers.get(_lookup_peer_by_prefix(peers, src_city))
+    if src_peer is None:
+        # Unknown source — pass through to local gc.
+        passthrough = ["gc", "mail", "reply", wisp_id]
+        if args.message:
+            passthrough += ["-m", args.message]
+        os.execvp("gc", passthrough)
+    src_city_name = _lookup_peer_by_prefix(peers, src_city)
+    wisp = api_call(src_peer, "GET", f"/v0/city/{src_city_name}/mail/{wisp_id}")
+    origin, _ = _parse_origin_header(wisp.get("body", "") or "")
+    if not origin:
+        sys.stderr.write(
+            f"warning: {wisp_id} has no origin metadata — replying locally via gc.\n"
+        )
+        passthrough = ["gc", "mail", "reply", wisp_id]
+        if args.message:
+            passthrough += ["-m", args.message]
+        os.execvp("gc", passthrough)
+    target_city = origin["city"]
+    target_alias = origin.get("alias", "mayor")
+    if target_city not in peers:
+        sys.stderr.write(
+            f"error: origin city '{target_city}' not in peers.toml — cannot route reply.\n"
+        )
+        sys.exit(1)
+    subject = args.subject or f"Re: {wisp.get('subject', '(no subject)')}"
+    home = _local_city()
+    reply_origin = None
+    if home and home != target_city:
+        reply_origin = {"city": home, "alias": _local_alias() or "unknown"}
+    body = _mail_body(target_alias, subject, args.message, origin=reply_origin)
+    resp = api_call(peers[target_city], "POST", f"/v0/city/{target_city}/mail", body=body)
+    sys.stdout.write(f"Replied {resp.get('id', '?')} to {target_city}:{target_alias}\n")
+
+
+def _lookup_peer_by_prefix(peers: dict, prefix: str) -> str | None:
+    """Map a 2-letter dolt prefix (yg, mg, as) to a peer name.
+
+    The bead-id convention is `<prefix>-<rest>` where prefix matches the
+    rig prefix. This helper finds which configured peer's name starts with
+    the prefix's letters as a hint. Falls back to the literal prefix.
+    """
+    if prefix in peers:
+        return prefix
+    for name in peers:
+        if name.startswith(prefix):
+            return name
+    return None
+
+
+def cmd_mail_inbox(args):
+    peers = load_peers()
+    city, alias = split_address(args.target) if args.target else (None, "")
+    if city is None or city not in peers:
+        passthrough = ["gc", "mail", "inbox"]
+        if args.target:
+            passthrough.append(args.target)
+        os.execvp("gc", passthrough)
+    path = f"/v0/city/{city}/mail"
+    if alias:
+        path += "?" + urllib.parse.urlencode({"assignee": alias})
+    resp = api_call(peers[city], "GET", path)
+    items = resp.get("items") or resp.get("messages") or []
+    if not items:
+        sys.stdout.write(f"No messages for {city}{':' + alias if alias else ''}\n")
+        return
+    for m in items:
+        flag = " " if m.get("read") else "*"
+        origin, _ = _parse_origin_header(m.get("body", "") or "")
+        from_label = m.get("from", "?") or "?"
+        if origin:
+            from_label = f"{origin['city']}:{origin.get('alias','?')}"
+        sys.stdout.write(
+            f"{flag} {m.get('id'):20s}  {from_label:25s}  {m.get('subject','(no subject)')}\n"
+        )
+
+
+def cmd_mail_read(args):
+    peers = load_peers()
+    city, wisp_id = split_address(args.id)
+    if city is None or city not in peers:
+        os.execvp("gc", ["gc", "mail", "read", args.id])
+    resp = api_call(peers[city], "GET", f"/v0/city/{city}/mail/{wisp_id}")
+    origin, body_text = _parse_origin_header(resp.get("body", "") or "")
+    from_label = resp.get("from", "?") or "?"
+    if origin:
+        from_label = f"{origin['city']}:{origin.get('alias','?')}"
+    sys.stdout.write(f"ID:       {wisp_id}\n")
+    sys.stdout.write(f"From:     {from_label}\n")
+    sys.stdout.write(f"To:       {city}:{resp.get('to','?')}\n")
+    sys.stdout.write(f"Subject:  {resp.get('subject','(no subject)')}\n")
+    sys.stdout.write(f"Sent:     {resp.get('created_at','?')}\n")
+    sys.stdout.write(f"Body:\n{body_text}\n")
+
+
+def cmd_cities(_args):
+    peers = load_peers()
+    if not peers:
+        sys.stdout.write("(no peers registered in ~/.gc/peers.toml)\n")
+        return
+    width = max(len(name) for name in peers)
+    for name, peer in peers.items():
+        try:
+            resp = api_call(peer, "GET", "/v0/cities")
+            mine = next(
+                (c for c in resp.get("items", []) if c.get("name") == name), None
+            )
+            if mine and mine.get("running"):
+                status = "running"
+            elif mine:
+                status = mine.get("status", "?")
+            else:
+                status = "unknown"
+        except SystemExit:
+            status = "unreachable"
+        sys.stdout.write(f"  {name.ljust(width)}  {peer['url']}  [{status}]\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="gcx", description="Cross-city Gas City wrapper")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    mail = sub.add_parser("mail", help="mail commands")
+    mail_sub = mail.add_subparsers(dest="mail_cmd", required=True)
+
+    send = mail_sub.add_parser("send", help="send mail (supports <city>:<alias>)")
+    send.add_argument("to")
+    send.add_argument("-s", "--subject", default="")
+    send.add_argument("-m", "--message", default="")
+    send.set_defaults(func=cmd_mail_send)
+
+    reply = mail_sub.add_parser(
+        "reply",
+        help="reply to a wisp — routes via origin metadata when available",
+    )
+    reply.add_argument("id")
+    reply.add_argument("-s", "--subject", default="")
+    reply.add_argument("-m", "--message", default="")
+    reply.set_defaults(func=cmd_mail_reply)
+
+    inbox = mail_sub.add_parser("inbox", help="show inbox (supports @<city>)")
+    inbox.add_argument("target", nargs="?")
+    inbox.set_defaults(func=cmd_mail_inbox)
+
+    read_cmd = mail_sub.add_parser("read", help="read a wisp (supports <city>:<id>)")
+    read_cmd.add_argument("id")
+    read_cmd.set_defaults(func=cmd_mail_read)
+
+    cities = sub.add_parser("cities", help="list registered peers and reachability")
+    cities.set_defaults(func=cmd_cities)
+
+    args = parser.parse_args(argv)
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+# mail-nudge — wake named sessions when their inbox grows.
+#
+# The gc mail-arrival path doesn't push notifications to recipient
+# sessions; mail surfaces only on UserPromptSubmit boundaries. For
+# autonomous agent-to-agent and cross-city flows that's not enough,
+# so this order polls each active named session's unread count and
+# nudges when it ticks up.
+#
+# Per-tick state: $GC_CITY_RUNTIME_DIR/mail-nudge/<alias>.last_unread
+
+[order]
+description = "Nudge named sessions when their inbox grows"
+trigger = "cooldown"
+interval = "20s"
+exec = "$PACK_DIR/assets/scripts/mail-nudge.sh"

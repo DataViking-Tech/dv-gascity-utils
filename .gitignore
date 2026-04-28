@@ -1,0 +1,8 @@
+.DS_Store
+*.swp
+*~
+
+# Gas City
+.beads/*
+!.beads/config.yaml
+!.beads/metadata.json

@@ -1,0 +1,21 @@
+# gascity-comms — cross-city Gas City communication tooling.
+#
+# Ships gcx, the city-aware mail wrapper that:
+#   - Routes <city>:<alias> sends and @<city> reads through each peer's gateway
+#   - Stamps origin-city metadata on outgoing wisps so replies round-trip
+#   - Auto-nudges the recipient on point-to-point sends (configurable)
+#   - Falls through to plain `gc` for non-cross-city calls
+#
+# Per-host setup (after import is materialized):
+#   1. Symlink the wrapper:
+#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gcx ~/.gc/bin/gcx
+#   2. Initialize the per-host peer registry:
+#        cp {{ConfigDir}}/system/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
+#      then fill in url + token_file for each peer the host should reach.
+#
+# Tokens stay outside the pack (one per host, mode 0600 in ~/.gc/tokens/).
+# peers.toml lives outside the pack (per-host registry, never shared).
+
+[pack]
+name = "gascity-comms"
+schema = 2
