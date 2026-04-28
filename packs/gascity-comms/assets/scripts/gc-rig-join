@@ -11,6 +11,12 @@
 # originally run `gc rig add` to create the database. The first city's flow
 # is unchanged.
 #
+# Pre-flight checks (run before any state is written):
+#   - --prefix must not collide with another rig already registered in this city
+#   - target dolt server must be reachable
+#   - --database (== --prefix) must already exist on that server (city A's job)
+#   - that database must be bd-shaped (has metadata, issues, schema_migrations)
+#
 # Idempotent: safe to re-run. Each step checks whether the work is already done.
 
 set -euo pipefail
@@ -124,6 +130,58 @@ if [ -z "$NAME" ]; then
 fi
 
 command -v gc >/dev/null || die "gc not on PATH"
+
+# Pre-flight 1: prefix must not collide with another rig in this city.
+# The cross-rig guard distinguishes rigs by prefix; two rigs in one site.toml
+# with the same prefix would make routing ambiguous.
+if gc rig list --json >/tmp/.gc-rig-join-rigs.$$ 2>/dev/null; then
+    if command -v jq >/dev/null 2>&1; then
+        EXISTING_OWNER=$(jq -r --arg p "$PREFIX" --arg n "$NAME" \
+            '.rigs[] | select(.prefix == $p and .name != $n) | .name' \
+            /tmp/.gc-rig-join-rigs.$$ | head -1)
+    else
+        EXISTING_OWNER=$(awk -v p="\"$PREFIX\"" -v n="\"$NAME\"" '
+            /"name":/  { gsub(",",""); name=$2 }
+            /"prefix":/{ gsub(",",""); if ($2 == p && name != n) print name }
+        ' /tmp/.gc-rig-join-rigs.$$ | head -1)
+    fi
+    rm -f /tmp/.gc-rig-join-rigs.$$
+    if [ -n "$EXISTING_OWNER" ]; then
+        die "prefix '$PREFIX' already registered in this city by rig $EXISTING_OWNER (use a different --prefix or remove the conflicting rig first)"
+    fi
+fi
+
+# Pre-flight 2: target dolt server must have the database.
+# Without this we'd fall through to ensure-project-id and surface a generic
+# "Error 1049 (HY000): database not found" — confusing for first-time joiners.
+if command -v dolt >/dev/null 2>&1; then
+    DBS_OUT=$(dolt --no-tls --user "$USER_" --password "" \
+                   --host "$HOST" --port "$PORT" \
+                   sql --query "SHOW DATABASES;" --result-format=csv 2>&1) || {
+        die "cannot reach dolt server at $HOST:$PORT (user=$USER_): $(echo "$DBS_OUT" | head -1)"
+    }
+    # CSV: first line is header "Database", subsequent lines are db names.
+    if ! echo "$DBS_OUT" | tail -n +2 | grep -qFx "$PREFIX"; then
+        AVAILABLE=$(echo "$DBS_OUT" | tail -n +2 | grep -vE '^(information_schema|mysql|__.+)$' | tr '\n' ' ')
+        die "database '$PREFIX' does not exist on $HOST:$PORT (city A must run 'gc rig add' first to create it; available: $AVAILABLE)"
+    fi
+    # Pre-flight 3: database must be bd-shaped before we adopt.
+    # If the DB exists but is empty (someone created it manually for some other
+    # purpose), `gc rig add --adopt` would happily wire us in and `bd list` would
+    # then explode at first read. Catch it here.
+    TBLS=$(dolt --no-tls --user "$USER_" --password "" \
+                --host "$HOST" --port "$PORT" \
+                sql --query "USE \`$PREFIX\`; SHOW TABLES;" --result-format=csv 2>&1) || {
+        die "cannot enumerate tables in database '$PREFIX' on $HOST:$PORT: $(echo "$TBLS" | head -1)"
+    }
+    for required in metadata issues schema_migrations; do
+        if ! echo "$TBLS" | tail -n +2 | grep -qFx "$required"; then
+            die "database '$PREFIX' on $HOST:$PORT is missing the '$required' table — not a bd-initialized database (city A must run 'bd init' / 'gc rig add' against it first)"
+        fi
+    done
+else
+    echo "warning: 'dolt' not on PATH; skipping server reachability + bd-shape pre-flight checks" >&2
+fi
 
 echo "==> Joining shared rig"
 echo "    local-path:    $LOCAL"

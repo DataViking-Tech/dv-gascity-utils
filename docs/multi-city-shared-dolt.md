@@ -347,5 +347,7 @@ Related docs:
 
 - [`cross-city-comms.md`](./cross-city-comms.md) — supervisor HTTP API
   cross-host (Caddy + `gcx`); orthogonal to the dolt sharing pattern.
-- [`shared-rig-prefix.md`](./shared-rig-prefix.md) — open problem: more
-  than one city pointing at the *same* prefix DB on the shared server.
+- [`shared-rig-prefix.md`](./shared-rig-prefix.md) — joining more than
+  one city to the *same* prefix DB on the shared server. Recipe + helper
+  + `metadata`-table audit + verified single-host primitives. Cross-host
+  validation pending.
