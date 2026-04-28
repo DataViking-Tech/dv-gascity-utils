@@ -1,6 +1,6 @@
 # Shared Rig Prefix Across Cities
 
-> **Status:** designed and validated against `gc 1.0.0` / `bd 1.0.3`. Recipe below stands up a "second city" against an existing rig database without re-initializing it. End-to-end test (yggdrasil ↔ midgard on `sp`) still pending in this rig — see follow-up bead.
+> **Status:** designed and validated against `gc 1.0.0` / `bd 1.0.3`. Recipe below stands up a "second city" against an existing rig database without re-initializing it. The single-host primitives (steps 1–2) are re-verified live; the cross-host yggdrasil ↔ midgard run is still pending coordination — see "Verified working" below and follow-up bead `dgu-2ro`.
 
 ## The problem
 
@@ -39,7 +39,7 @@ So `--adopt` plus `gc dolt-state ensure-project-id` *is* the join primitive — 
 
 ## How the identity check works
 
-`gc rig add` (and `gc rig set-endpoint --external` without `--adopt-unverified`) verifies project identity by comparing `<path>/.beads/metadata.json#project_id` against `<database>.bd_metadata#_project_id`. Mismatch → fatal: `database _project_id %q does not match desired %q`.
+`gc rig add` (and `gc rig set-endpoint --external` without `--adopt-unverified`) verifies project identity by comparing `<path>/.beads/metadata.json#project_id` against the database's `metadata#_project_id` row (the table is named `metadata`, not `bd_metadata` — earlier drafts of this doc used the wrong name). Mismatch → fatal: `database _project_id %q does not match desired %q`.
 
 Three scenarios, all covered by `gc dolt-state ensure-project-id`:
 
@@ -176,6 +176,18 @@ gc-rig-join /local/path --prefix sp --name synth-panel \
 
 The script does steps 1–3 (and optionally step 5's `set-endpoint` call) idempotently, with a `--dry-run` mode. See its `--help` for details.
 
+It also runs four pre-flight checks before touching any state, so failures surface as actionable messages rather than partway-through corruption:
+
+| Check | Failure surfaces as |
+|---|---|
+| Prefix has no hyphen | `prefix '<p>' must not contain hyphens (conflicts with bead ID format)` |
+| Prefix not already registered in this city | `prefix '<p>' already registered in this city by rig <name>` |
+| Dolt server reachable | `cannot reach dolt server at <host>:<port>` |
+| Database `<p>` exists on the server | `database '<p>' does not exist on <host>:<port> (city A must run 'gc rig add' first; available: …)` |
+| Database is bd-shaped (has `metadata`, `issues`, `schema_migrations`) | `database '<p>' is missing the '<table>' table — not a bd-initialized database` |
+
+The bd-shape and reachability checks need `dolt` on PATH; the script falls back to a warning + skip if `dolt` isn't installed, but the `gc rig add --adopt` call inside step 3 will then raise the underlying error itself.
+
 ## Variant: hand-pinned 4-file recipe (when you already know the project_id)
 
 Midgard mayor produced a more direct variant when joining `sp` on `sol-mac-mini` — they had the `project_id` from prior work, so they skipped `ensure-project-id` and pinned all four config files by hand. The result is identical on-disk + on-server state; it just elides one command.
@@ -240,6 +252,86 @@ This writes a canonical normalized config that the auto-detector won't fight.
 
 Both produce identical state on disk and on the shared server.
 
+The pinned-paste variant's mtime-clobber footgun (the "Hardening note" above) means the helper's pre-flight isn't enough on its own to keep a long-lived joined rig healthy — the auto-detector running on the live runtime can still mangle `issue_prefix`. `gc-rig-join` covers the join *moment*; `gc dolt-config normalize-scope` is the equivalent for steady-state.
+
+## bd `metadata` table audit
+
+`bd` stores per-database metadata in two tables:
+
+- `metadata` — intended to be **shared** across all cities joined to the database. Wins all writes from any city.
+- `local_metadata` — intended to be **per-host**. (Currently this table is also dolt-replicated, so writes from one city *do* land in the others — see "Open questions" below.)
+
+A live audit against the shared dolt running on `mani-mac-mini.tail032ed9.ts.net:16022` (2026-04-28) found these rows:
+
+| Database | `metadata` keys | `local_metadata` keys |
+|---|---|---|
+| `sp` (shared synth-panel) | `_project_id`, `clone_id`, `last_import_time`, `repo_id` | `bd_version` |
+| `yg` | `_project_id`, `clone_id`, `last_import_time`, `repo_id` | `bd_version`, `tip_claude_setup_last_shown` |
+| `mg` | `_project_id`, `clone_id`, `last_import_time`, `repo_id` | `bd_version`, `tip_claude_setup_last_shown` |
+| `dgu` | `_project_id`, `repo_id` | `tip_claude_setup_last_shown` |
+| `as` (asgard) | `_project_id` | (empty) |
+
+Verdict per key:
+
+| Key | Today | Should be | Notes |
+|---|---|---|---|
+| `_project_id` | `metadata` (shared) | shared ✓ | Project identity. Matches the design. |
+| `repo_id` | `metadata` (shared) | shared ✓ | Project-level git-repo identity. Matches. |
+| `clone_id` | `metadata` (shared) | per-host ✗ | Each clone of `bd` should have its own. Currently a city writing this clobbers what the other city wrote. (`yg` and `mg` show identical values today — likely just because one came up first and the other inherited from the dolt fetch — but conceptually wrong.) |
+| `last_import_time` | `metadata` (shared) | per-host ✗ | Each city's `bd import` writes its own timestamp; the row from `yg` and `mg` clobber each other on every import. |
+| `bd_version` | `local_metadata` | per-host ✓ | Correct. (But: even `local_metadata` is currently dolt-replicated, so per-host stripping needs schema-side support — the *intent* is right, the isolation isn't enforced.) |
+| `tip_claude_setup_last_shown` | `local_metadata` | per-host ✓ | Correct intent; same caveat. |
+
+The two misplaced keys (`clone_id`, `last_import_time`) are upstream `bd` schema bugs, not gc bugs. Filed as follow-up — see "Open questions" below.
+
+## Verified working — single-host primitives (2026-04-28)
+
+Re-verified against the live `sp` database on `127.0.0.1:16022`:
+
+```
+$ TMPDIR=$(mktemp -d /tmp/joinscan.XXXXX)
+$ mkdir -p "$TMPDIR/.beads"
+$ cat > "$TMPDIR/.beads/metadata.json" <<'EOF'
+{ "backend":"dolt", "database":"dolt", "dolt_database":"sp", "dolt_mode":"server" }
+EOF
+
+$ gc dolt-state ensure-project-id \
+    --metadata "$TMPDIR/.beads/metadata.json" \
+    --host 127.0.0.1 --port 16022 --user root --database sp
+project_id       gc-local-771a7e949f311dca91f9ebc4225e2de0
+metadata_updated true
+database_updated false
+source           database
+
+$ cat "$TMPDIR/.beads/metadata.json"
+{
+  "backend": "dolt",
+  "database": "dolt",
+  "dolt_database": "sp",
+  "dolt_mode": "server",
+  "project_id": "gc-local-771a7e949f311dca91f9ebc4225e2de0"
+}
+```
+
+Confirms: the join primitive (`source: database`) still pulls the canonical `_project_id` from the shared dolt into a fresh stub `metadata.json`. This is the load-bearing piece that makes joining without forking identity possible.
+
+The `gc-rig-join` helper's hardened pre-flight checks were also exercised live:
+
+| Scenario | Result |
+|---|---|
+| `--prefix sp` (collides with already-registered `synth-panel`) | `prefix 'sp' already registered in this city by rig synth-panel` ✓ |
+| `--prefix xx` (no such DB on server) | `database 'xx' does not exist on 127.0.0.1:16022 (… available: as dgu mg sp yg)` ✓ |
+| `--port 9999` (unreachable) | `cannot reach dolt server at 127.0.0.1:9999 (user=root): … connection refused` ✓ |
+| `--prefix bad-prefix` (hyphen) | `prefix 'bad-prefix' must not contain hyphens (conflicts with bead ID format)` ✓ |
+
+What is **not** yet verified end-to-end:
+
+- A second city standing up its own `.gc/site.toml` and registering `--adopt`, then having `bd list` from inside the joined path show beads created by city A. Requires either a sandbox city on this same host (`gc init /tmp/test-city-b`) or the live yg ↔ mg run.
+- Cross-rig sling routing across cities once both have a local rig with the same prefix — predicted to "just work" since the cross-rig guard finds a local rig with the matching prefix on each side, but unverified.
+- Identity-mismatch recovery (a second city accidentally ran `gc rig add` without `--adopt` and minted a fresh `project_id`). The proposed recovery is `rm -rf .beads/` + re-run `gc-rig-join`. The "no orphan rows" claim in particular is unverified — there's nothing left in `metadata.json` after the rm, but the misregistered `[[rig]]` entry in `.gc/site.toml` from the bad `gc rig add` may need a `gc rig remove` to clean up before re-joining can register without a name collision.
+
+These are the deliverables of `dgu-2ro` that need a coordinated yg ↔ mg run to validate. The bd-schema audit row above can be acted on without that coordination.
+
 ## Cleaning up the midgard `sy` orphan
 
 **Status: resolved 2026-04-28.** Yggdrasil mayor verified the `sy` database on the shared dolt server was empty (0 issues, 0 wisps) and dropped it via direct SQL. Midgard had already pivoted its rig declaration to `prefix = "sp"`, so no rig referenced `sy` from either side.
@@ -269,18 +361,25 @@ DOLT_CLI_PASSWORD="" dolt --host 127.0.0.1 --port 16022 --user root --no-tls sql
 
 ## Test plan
 
-This recipe is validated piecewise (each command tested live against the running shared dolt server) but has not yet been exercised end-to-end across two cities. The follow-up bead should:
+What's validated, what's not:
 
-1. Stand up a brand-new test rig on yg (`gc rig add /tmp/test-rig --name test-shared --prefix tsh`) and confirm a bead is created in the `tsh` DB.
-2. From a second sandbox path that simulates "city B" — easiest way: a separate shell with `BEADS_DIR` and `GC_BEADS_SCOPE_ROOT` unset, against an alternate `.gc/` site dir — pre-stage `.beads/`, run `ensure-project-id`, run `gc rig add --adopt`. Verify `bd list` from both sides shows the same beads.
-3. Sling a bead from each side, confirm both cities' polecat pools see it, and confirm the cross-rig guard does not fire.
-4. Once the local end-to-end works, repeat on the actual yg ↔ mg pair after cleaning up `sy`.
+| Step | Status |
+|---|---|
+| Each command tested live against the running shared dolt | ✓ (initial doc + re-verified 2026-04-28) |
+| `ensure-project-id --source database` pulls canonical id into stub `metadata.json` | ✓ (re-verified, see "Verified working" above) |
+| `gc-rig-join` pre-flight: collision / unreachable / missing-DB / bad-prefix all surface clean errors | ✓ (re-verified) |
+| Stand up a sandbox `.gc/site.toml` for "city B" and run the recipe through `gc rig add --adopt` | pending (needs `gc init /tmp/test-city-b`) |
+| `bd list` from city B shows beads created by city A | pending (gated on previous row) |
+| Sling a bead from each side; cross-rig guard does not fire | pending |
+| Identity-mismatch recovery (`rm -rf .beads/` + re-join after a bad `gc rig add`) | pending |
+| Live yg ↔ mg pair after cleaning up `sy` orphan on mg | pending (gated on mg-side cleanup) |
 
 ## Open questions / future work
 
-- **`gc rig join` proper.** The shell helper is a stopgap. Upstream-worthy: a real subcommand that wraps these steps, validates the prefix, and bails with a useful error if the database doesn't exist on the target server (instead of letting `ensure-project-id` fail with a generic connection error).
-- **Identity mismatch recovery.** If a second city accidentally ran `gc rig add` (no `--adopt`) and minted its own `project_id`, the resulting metadata is now divergent from the shared DB. The fix would be: delete the local `.beads/`, re-run the join recipe. We should sanity-check this works without leaving stale rows somewhere.
-- **`bd_metadata` schema.** The `_project_id` row lives in a `bd_metadata` table inside each rig database. There may be other rows there (auto-export config, local versions, etc.) that *should* be per-host rather than shared. Worth a follow-up audit.
+- **`gc rig join` proper.** The shell helper is a stopgap. Upstream-worthy: a real subcommand that wraps the steps, runs the same pre-flight checks (now in the shell helper) at the gc level, and ideally lets the city's site.toml host/port defaults bubble up so callers don't have to repeat them. Tracked under `dgu-2ro` deliverable 4 (out of scope for this rig — needs upstream `gc` source changes).
+- **Identity mismatch recovery.** If a second city accidentally ran `gc rig add` (no `--adopt`) and minted its own `project_id`, the resulting metadata is now divergent from the shared DB. The proposed fix — `rm -rf .beads/` + re-run the join recipe — leaves the misregistered `[[rig]]` entry in `.gc/site.toml` behind, which may need a `gc rig remove` first to avoid a name conflict on re-add. Needs a live exercise to confirm exact recovery sequence.
+- **`bd` schema split between `metadata` and `local_metadata`.** The "bd `metadata` table audit" section above identifies `clone_id` and `last_import_time` as misplaced — they're in the shared `metadata` table but conceptually per-host. A `bd import` on one city writes its timestamp; the next `bd import` on another city overwrites it. Worth a bead on the upstream `bd` repo to move these to `local_metadata` (and to make `local_metadata` actually local — see next bullet).
+- **`local_metadata` is not actually local.** Despite the name, dolt replicates `local_metadata` along with everything else. So `bd_version` from one city overwrites the other on push/pull. The fix probably needs either a per-host filter at the `bd push`/`bd pull` boundary, or a `localonly_metadata` / `__hostname__` partition key inside the table. Filed-worthy.
 - **Refinery coordination across cities.** Two refineries draining the same queue should be fine (they atomic-claim too) but we haven't stress-tested it. Worth filing once the basic join works.
 - **Worktree path collisions.** Each city manages its own `.gc/worktrees/<rig>/<polecat>/` so this should be safe by construction, but worth confirming that the work-bead `metadata.work_dir` is interpreted per-host (it's an absolute path, so the witness on city B wouldn't try to clean a path written by city A).
 
