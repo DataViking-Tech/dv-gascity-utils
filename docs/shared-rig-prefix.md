@@ -176,19 +176,96 @@ gc-rig-join /local/path --prefix sp --name synth-panel \
 
 The script does steps 1–3 (and optionally step 5's `set-endpoint` call) idempotently, with a `--dry-run` mode. See its `--help` for details.
 
-## Cleaning up the midgard `sy` orphan
+## Variant: hand-pinned 4-file recipe (when you already know the project_id)
 
-The misregistered rig on midgard's side leaves `sy` on the shared dolt with no users once removed. Sequence (run on `sol-mac-mini`):
+Midgard mayor produced a more direct variant when joining `sp` on `sol-mac-mini` — they had the `project_id` from prior work, so they skipped `ensure-project-id` and pinned all four config files by hand. The result is identical on-disk + on-server state; it just elides one command.
+
+The four files that **must** agree (drift in any one → orders fail with `prefix mismatch`):
+
+1. `<city>/city.toml` — declare the rig **with the prefix explicit**:
+
+   ```toml
+   [[rigs]]
+   name = "synthpanel"
+   prefix = "sp"
+   includes = ["<absolute-path-to-shared-gastown-pack>"]
+   ```
+
+2. `<city>/.gc/site.toml` — path mapping:
+
+   ```toml
+   [[rig]]
+   name = "synthpanel"
+   path = "<absolute-path-to-local-rig>"
+   ```
+
+3. `<rig>/.beads/config.yaml` — pin **both** `issue_prefix` and `issue-prefix` (bd reads either, but supervisor reload can auto-detect from cwd basename and clobber one of them):
+
+   ```yaml
+   issue_prefix: sp
+   issue-prefix: sp
+   dolt.host: <shared dolt host>
+   dolt.port: 16022
+   dolt.auto-start: false
+   gc.endpoint_origin: inherited_city
+   gc.endpoint_status: unverified
+   ```
+
+4. `<rig>/.beads/metadata.json` — paste the canonical project_id:
+
+   ```json
+   {
+     "backend": "dolt",
+     "database": "dolt",
+     "dolt_database": "sp",
+     "dolt_mode": "server",
+     "project_id": "<copy from city A's metadata.json>"
+   }
+   ```
+
+`<city>/.beads/routes.jsonl` auto-registers `{"prefix":"sp","path":"rigs/synthpanel"}` once the prefix is declared.
+
+**Hardening note from midgard's experience:** the supervisor's auto-detector can clobber `issue_prefix` when `config.yaml`'s mtime jumps (e.g. on dog-session spawn). If you see `prefix` drift mid-run, re-pin manually OR run:
 
 ```bash
-# 1. Drop midgard's bad rig registration
-gc rig remove synth-panel       # ← whatever name midgard used; check with `gc rig list`
-
-# 2. Garbage-collect the now-orphaned database
-gc dolt cleanup                 # finds sy, prompts to drop it
+gc dolt-config normalize-scope --dir <rig> --city <city> --prefix sp --dolt-database sp
 ```
 
-`gc dolt cleanup` only removes databases that are not referenced by *any* `[[rig]]` in the city's site.toml. Since yg references `sp` (not `sy`) and mg has just removed its `sy` reference, `sy` is now an orphan and safe to drop. Then run the recipe above to join `sp`.
+This writes a canonical normalized config that the auto-detector won't fight.
+
+**When to use which variant:**
+
+- *Pinned-paste* (this section): you already have city A's `project_id` in hand and copy-paste-tolerant operators. Fewer commands, more discipline.
+- *`ensure-project-id` flow* (recipe above): you want the join to work even when you don't know the `project_id` — the helper pulls it from the live DB. Better for automation / scripted onboarding.
+
+Both produce identical state on disk and on the shared server.
+
+## Cleaning up the midgard `sy` orphan
+
+**Status: resolved 2026-04-28.** Yggdrasil mayor verified the `sy` database on the shared dolt server was empty (0 issues, 0 wisps) and dropped it via direct SQL. Midgard had already pivoted its rig declaration to `prefix = "sp"`, so no rig referenced `sy` from either side.
+
+The general cleanup pattern (when an orphan does have content you want to keep, OR when you'd rather use the supported tooling):
+
+```bash
+# 1. Drop the bad rig registration in the city that created the orphan
+gc rig remove <name>            # whatever name the orphan rig used; check with `gc rig list`
+
+# 2. Garbage-collect the now-orphaned database
+gc dolt cleanup                 # finds the orphan, prompts to drop it
+```
+
+`gc dolt cleanup` only removes databases that are not referenced by *any* `[[rig]]` in the city's site.toml.
+
+For the empty-orphan shortcut taken here:
+
+```bash
+# Verify empty first
+DOLT_CLI_PASSWORD="" dolt --host 127.0.0.1 --port 16022 --user root --no-tls --use-db <orphan> sql -q \
+  "SELECT 'issues', COUNT(*) FROM issues UNION ALL SELECT 'wisps', COUNT(*) FROM wisps"
+
+# If both 0, drop directly (use backticks if the prefix is a SQL reserved word)
+DOLT_CLI_PASSWORD="" dolt --host 127.0.0.1 --port 16022 --user root --no-tls sql -q "DROP DATABASE \`<orphan>\`"
+```
 
 ## Test plan
 
