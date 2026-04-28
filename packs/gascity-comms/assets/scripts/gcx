@@ -119,13 +119,20 @@ def api_call(peer: dict, method: str, path: str, body: dict | None = None) -> di
         data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
+        # 30s socket timeout — without this, a wedged remote supervisor's
+        # mail-GET endpoint can hang the wrapper indefinitely. mg surfaced
+        # this as mg-492d. 30s is generous for healthy paths and surfaces
+        # the actual stuck endpoint when something's wrong.
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
         sys.stderr.write(f"HTTP {e.code} {url}: {body_text}\n")
         sys.exit(1)
+    except (urllib.error.URLError, TimeoutError) as e:
+        sys.stderr.write(f"network error contacting {url}: {e}\n")
+        sys.exit(2)
 
 
 ORIGIN_HEADER = "X-Gascity-Origin"
