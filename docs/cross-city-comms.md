@@ -285,6 +285,8 @@ $ gcx mail reply mg-7q2k -m "yes"
 
 - **One gateway port per host.** The Caddyfile binds `8472` directly. Co-tenanted cities on the same host (yggdrasil + asgard here) share that port and that token by design — there is no per-city auth. If you need per-city authorization you'd add it inside the supervisor or split hosts.
 
+- **Operational knowledge doesn't survive mayor restart by default.** The wire above is alive after restart, but a fresh mayor session has no memory of *which* peers are configured, what the gateway URLs are, that this race exists, or what was decided last week. The fix is opt-in: import the `cross-city-prime` template fragment from `packs/gascity-comms/template-fragments/` plus a per-host `local-prime` stub describing the host's specific peers/rigs/decisions. See `docs/mayor-prompt-prime-recipe.md` for the wiring and `docs/host-prime-stub.md` for the local-stub convention. Each host opts in independently — there is no automatic distribution because the host-specific facts genuinely differ per host.
+
 ## Reference
 
 - Live gateways:
