@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# gc-rig-join — join an existing shared-prefix rig from a second city.
+#
+# Wraps the three-step recipe documented in dv-gascity-utils/docs/shared-rig-prefix.md:
+#   1. pre-stage .beads/{config.yaml, metadata.json} stub
+#   2. gc dolt-state ensure-project-id   (pulls canonical project_id from the DB)
+#   3. gc rig add <path> --adopt --prefix <p> [--name …]
+# Optionally also runs step 4: gc rig set-endpoint <name> --external …
+#
+# Use this on the *second* (or third, or Nth) city — the city that did NOT
+# originally run `gc rig add` to create the database. The first city's flow
+# is unchanged.
+#
+# Idempotent: safe to re-run. Each step checks whether the work is already done.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-rig-join — join an existing shared-prefix rig from a second city.
+
+Usage:
+  gc-rig-join <local-path> --prefix <p> [options]
+
+Required:
+  --prefix <p>           Existing rig prefix on the shared dolt (e.g. sp)
+
+Options:
+  --name <name>          Rig name in the second city's site.toml (default: derived from path)
+  --host <host>          Shared dolt host (default: 127.0.0.1)
+  --port <port>          Shared dolt port (default: 16022)
+  --user <user>          Shared dolt user (default: root)
+  --pin-endpoint         After --adopt, also run `gc rig set-endpoint <name> --external …`
+                         (use when the city's own dolt is NOT the shared one)
+  --dry-run              Show what would be done; touch nothing
+  -h, --help             Show this help
+
+The local-path is the directory holding the project's git clone on this host.
+It must already exist (you cloned the repo). This script creates `.beads/` inside it.
+
+Examples:
+  # Second city joining `sp` (synth-panel) where the city already use-externals
+  # the shared dolt server:
+  gc-rig-join ~/openclaw/midgard/rigs/synthpanel \
+              --prefix sp --name synth-panel \
+              --host mani-mac-mini.tail032ed9.ts.net --port 16022
+
+  # Second city's city-level dolt is local; pin only this rig to the shared one:
+  gc-rig-join /opt/projects/synthpanel \
+              --prefix sp --name synth-panel \
+              --host shared.example.com --port 16022 --pin-endpoint
+
+  # Dry-run to preview:
+  gc-rig-join /opt/projects/synthpanel --prefix sp --dry-run
+EOF
+}
+
+LOCAL=""
+PREFIX=""
+NAME=""
+HOST="127.0.0.1"
+PORT="16022"
+USER_="root"
+PIN_ENDPOINT=0
+DRY_RUN=0
+
+die() { echo "gc-rig-join: $*" >&2; exit 1; }
+
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'WOULD RUN: '
+        printf '%q ' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+write_file() {
+    local path="$1" content="$2"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "WOULD WRITE: $path"
+        echo "--- contents ---"
+        printf '%s' "$content"
+        echo "--- end ---"
+    else
+        printf '%s' "$content" > "$path"
+        echo "WROTE: $path"
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --prefix) PREFIX="${2:-}"; shift 2 ;;
+        --name) NAME="${2:-}"; shift 2 ;;
+        --host) HOST="${2:-}"; shift 2 ;;
+        --port) PORT="${2:-}"; shift 2 ;;
+        --user) USER_="${2:-}"; shift 2 ;;
+        --pin-endpoint) PIN_ENDPOINT=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1 (try --help)" ;;
+        *)
+            if [ -z "$LOCAL" ]; then LOCAL="$1"
+            else die "unexpected argument: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$LOCAL" ]  || { usage >&2; exit 2; }
+[ -n "$PREFIX" ] || die "--prefix is required"
+[ -d "$LOCAL" ]  || die "local path does not exist: $LOCAL  (clone the repo first)"
+
+# Prefixes: bd-side rule is no hyphens (conflicts with bead ID format).
+case "$PREFIX" in
+    *-*) die "prefix '$PREFIX' must not contain hyphens (conflicts with bead ID format)" ;;
+esac
+
+if [ -z "$NAME" ]; then
+    NAME="$(basename -- "$LOCAL")"
+fi
+
+command -v gc >/dev/null || die "gc not on PATH"
+
+echo "==> Joining shared rig"
+echo "    local-path:    $LOCAL"
+echo "    prefix:        $PREFIX"
+echo "    rig name:      $NAME"
+echo "    shared dolt:   $HOST:$PORT (user=$USER_)"
+echo "    pin endpoint:  $([ "$PIN_ENDPOINT" -eq 1 ] && echo yes || echo no)"
+[ "$DRY_RUN" -eq 1 ] && echo "    dry-run:       yes"
+echo
+
+# Step 1: pre-stage .beads/  -----------------------------------------------
+BEADS_DIR="$LOCAL/.beads"
+CONFIG_YAML="$BEADS_DIR/config.yaml"
+METADATA_JSON="$BEADS_DIR/metadata.json"
+
+if [ -e "$CONFIG_YAML" ] || [ -e "$METADATA_JSON" ]; then
+    echo "==> Step 1: .beads/ already present, leaving it alone"
+    if [ -e "$CONFIG_YAML" ] && ! grep -q "^issue_prefix: *$PREFIX\$" "$CONFIG_YAML"; then
+        die "$CONFIG_YAML has a different issue_prefix than --prefix=$PREFIX; remove .beads/ and re-run"
+    fi
+else
+    echo "==> Step 1: pre-stage .beads/ stub"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "WOULD MKDIR: $BEADS_DIR"
+    else
+        mkdir -p "$BEADS_DIR"
+    fi
+    write_file "$CONFIG_YAML" "$(cat <<EOF
+issue_prefix: $PREFIX
+issue-prefix: $PREFIX
+dolt.auto-start: false
+EOF
+)"
+    write_file "$METADATA_JSON" "$(cat <<EOF
+{
+  "backend": "dolt",
+  "database": "dolt",
+  "dolt_database": "$PREFIX",
+  "dolt_mode": "server"
+}
+EOF
+)"
+fi
+echo
+
+# Step 2: pull canonical project_id ----------------------------------------
+echo "==> Step 2: gc dolt-state ensure-project-id"
+run gc dolt-state ensure-project-id \
+    --metadata "$METADATA_JSON" \
+    --host "$HOST" --port "$PORT" --user "$USER_" \
+    --database "$PREFIX"
+echo
+
+# Step 3: register the rig --------------------------------------------------
+echo "==> Step 3: gc rig add --adopt"
+run gc rig add "$LOCAL" --name "$NAME" --prefix "$PREFIX" --adopt
+echo
+
+# Step 4 (optional): pin per-rig endpoint ----------------------------------
+if [ "$PIN_ENDPOINT" -eq 1 ]; then
+    echo "==> Step 4: gc rig set-endpoint --external"
+    run gc rig set-endpoint "$NAME" --external \
+        --host "$HOST" --port "$PORT" --user "$USER_"
+    echo
+fi
+
+echo "Done. Verify with:"
+echo "  ( cd $LOCAL && bd list --limit 5 )"
+echo "  gc rig list"
+echo "  gc rig status $NAME"

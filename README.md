@@ -6,7 +6,7 @@ DataViking-Tech utilities and patterns for [Gas City](https://docs.gascityhall.c
 
 ### Packs
 
-- **`packs/gascity-comms/`** — cross-city mail tooling. Ships `gcx` (city-aware mail wrapper), the `mail-nudge` order (auto-wakes recipient sessions when their inbox grows), and a peers.toml template. Importable into any Gas City workspace.
+- **`packs/gascity-comms/`** — cross-city mail tooling. Ships `gcx` (city-aware mail wrapper), the `mail-nudge` order (auto-wakes recipient sessions when their inbox grows), `gc-rig-join` (joins an existing shared-prefix rig from a second city — see `docs/shared-rig-prefix.md`), and a peers.toml template. Importable into any Gas City workspace.
 
 ### Docs
 
@@ -34,6 +34,7 @@ Then per-host:
 
 ```bash
 ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gcx ~/.gc/bin/gcx
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-rig-join ~/.gc/bin/gc-rig-join
 cp ~/dv-gascity-utils/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
 # fill in url + token_file for each peer
 ```
