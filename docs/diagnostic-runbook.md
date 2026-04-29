@@ -200,9 +200,95 @@ If step 5 shows no spawn line, common causes:
 | Symptom                                   | Likely cause / fix                                                    |
 |-------------------------------------------|-----------------------------------------------------------------------|
 | `recently_created>0` skip                 | Reconciler beat the watchdog. Lower `AGENT_WATCHDOG_RECENT_CUTOFF=0` and re-run. |
+| Settling guard skip (no log line)         | The heartbeat is younger than `RECENT_CUTOFF_SECONDS`. Wait for it to age past the cutoff or remove `$GC_CITY_RUNTIME_DIR/agent-watchdog/<rig>__gastown.<tpl>.last_seen_live` and rerun. |
 | `live>0` skip                             | A reaper missed; check `gc session list --state=all` for stale beads. |
 | Order didn't fire                         | Confirm with `gc orders status agent-watchdog` and check `gc reload`. |
 | `spawn failed for $RIG/gastown.polecat`   | Run `gc session new $RIG/gastown.polecat --no-attach` manually to surface the underlying error. |
+
+### Test sequence: confirm only ONE spawn in the recovery window
+
+This validates the over-spawn fix — when both `min_active=1` and the
+watchdog could fire, exactly one session should come back per template.
+Disruptive: kills all sessions in the target rig.
+
+1. **Pick a low-traffic rig and confirm warm pool is on.**
+
+   ```bash
+   RIG=synth-panel
+   gc config explain --agent polecat --rig "$RIG" | grep min_active_sessions
+   # expected: min_active_sessions = 1  # city.toml
+   ```
+
+2. **Note the heartbeat state for both templates.** The recovery
+   path relies on the heartbeat being recent at kill time.
+
+   ```bash
+   ls -la "${GC_CITY_RUNTIME_DIR}/agent-watchdog/${RIG}__gastown.polecat.last_seen_live"
+   ls -la "${GC_CITY_RUNTIME_DIR}/agent-watchdog/${RIG}__gastown.refinery.last_seen_live"
+   ```
+
+3. **Queue a no-op bead so the watchdog has a reason to fire.**
+
+   ```bash
+   BEAD=$(bd create --title "watchdog over-spawn test" --type chore --priority 3 \
+     --json | jq -r '.id')
+   bd update "$BEAD" --set-metadata "gc.routed_to=$RIG/gastown.polecat" --status=open
+   ```
+
+4. **Kill all live polecat + refinery sessions in the rig.**
+
+   ```bash
+   for tpl in polecat refinery; do
+       gc session list --state=active --template "$RIG/gastown.$tpl" --json \
+         | jq -r '.[].Alias' \
+         | xargs -I{} gc session kill {} --force
+   done
+   START=$(date +%s)
+   ```
+
+5. **Wait through the recovery window (~2 min).** The reconciler's
+   `min_active=1` should backfill within ~30-60s; the watchdog's
+   settling guard should defer until the heartbeat ages out (90s).
+
+   ```bash
+   sleep 120
+   ```
+
+6. **Confirm exactly one session came back per template.**
+
+   ```bash
+   gc session list --state=all --template "$RIG/gastown.polecat" --json \
+     | jq --argjson start "$START" '[.[] | select((.CreatedAt | fromdateiso8601) >= $start)] | length'
+   # expect: 1
+   gc session list --state=all --template "$RIG/gastown.refinery" --json \
+     | jq --argjson start "$START" '[.[] | select((.CreatedAt | fromdateiso8601) >= $start)] | length'
+   # expect: 1
+   ```
+
+7. **Confirm the watchdog deferred to the reconciler.** With
+   `min_active=1` and the heartbeat fresh at kill time, the watchdog
+   should not have spawned anything in the recovery window.
+
+   ```bash
+   gc orders log agent-watchdog --tail 50 \
+     | grep "agent-watchdog: spawn $RIG" \
+     | wc -l
+   # expect: 0  (reconciler's min_active backfill ran instead)
+   ```
+
+   If this shows >0, either the heartbeat aged past the cutoff before
+   the reconciler spawned, or the reconciler is genuinely broken and
+   the watchdog correctly stepped in.
+
+8. **Clean up.**
+
+   ```bash
+   bd update "$BEAD" --status=closed --notes "over-spawn test complete"
+   ```
+
+If step 6 shows >1 session, the settling guard isn't working. Check
+that the heartbeat file existed at kill time (step 2) and that
+`AGENT_WATCHDOG_RECENT_CUTOFF` is at least 90s.
 
 ### Verifying warm-pool overrides
 

@@ -61,14 +61,21 @@ it bypasses `scaleCheck` entirely.
 rig listed in `gc config show`, for each scaled template
 (`refinery`, `polecat`):
 
-1. Count queued work — beads routed to `<rig>/gastown.<template>` with
+1. Count present sessions (any state — active, asleep, creating). When
+   `present > 0`, write the current epoch to a per-template heartbeat
+   file under `$GC_CITY_RUNTIME_DIR/agent-watchdog/`.
+2. Count live (active) sessions — used for the spawn decision.
+3. Count queued work — beads routed to `<rig>/gastown.<template>` with
    no assignee, plus open beads explicitly assigned to that template
    name.
-2. Count live sessions — `gc session list --state=active --template=...`.
-3. Count *recent* sessions — created within the last 60s (configurable
-   via `AGENT_WATCHDOG_RECENT_CUTOFF`). This guards against racing the
-   reconciler if it's actively materializing one.
-4. Spawn iff `queued > 0 AND live == 0 AND recent == 0`.
+4. Settling guard: if the heartbeat is younger than the recent cutoff
+   (default 90s, configurable via `AGENT_WATCHDOG_RECENT_CUTOFF`), the
+   slot was just emptied — defer to give the reconciler's `min_active`
+   path time to backfill before the watchdog races it.
+5. Recent-create guard: count sessions whose `CreatedAt` is within the
+   last `RECENT_CUTOFF_SECONDS`. Catches the reconciler's in-flight
+   `creating` session before it transitions to `active`.
+6. Spawn iff `queued > 0 AND live == 0 AND settle == 0 AND recent == 0`.
 
 Spawning calls `gc session new <full-template> --no-attach` with no
 `--alias`, so the supervisor picks a free name from the namepool.
@@ -81,6 +88,22 @@ The order processes templates in this order: **refinery first**, then
 polecat. A stalled refinery blocks merge throughput across all polecats
 in the rig, so the spawn budget goes to the refinery first when both
 need help.
+
+### Why the heartbeat in addition to recent-create
+
+A polecat that ran for 30 minutes and just drained has a `CreatedAt`
+30+ minutes old. The recent-create guard alone can't tell that case
+apart from "no polecat for hours" — both have zero sessions created in
+the last 90s. Without the heartbeat, the watchdog would race the
+reconciler's `min_active` backfill at the moment the slot becomes
+empty.
+
+The heartbeat closes that gap by recording every tick where the slot
+was full. When the next tick observes the slot empty, comparing the
+heartbeat against `RECENT_CUTOFF_SECONDS` answers the right question:
+"was the slot full *recently*?" If yes, the reconciler is already
+working on a backfill — defer. If the heartbeat is older than the
+cutoff, the reconciler has clearly failed and the watchdog steps in.
 
 ## Why this is a backstop, not the primary path
 
@@ -99,9 +122,17 @@ healthy reconciler.
 
 ## Configuration knobs
 
-- `AGENT_WATCHDOG_RECENT_CUTOFF` (default `60`, seconds): how far back to
-  look for "the reconciler may already be spawning one." Raise it if
-  spawns routinely take longer than 60s on this host.
+- `AGENT_WATCHDOG_RECENT_CUTOFF` (default `90`, seconds): the
+  settling/recent window. Used for both the heartbeat-based settling
+  guard and the CreatedAt-based recent-create guard. Raise it if
+  spawns routinely take longer than 90s on this host. The default
+  was raised from 60s to 90s after observing over-spawn races where
+  `min_active=1` and the watchdog both fired during the post-drain
+  recovery window.
+
+- `GC_CITY_RUNTIME_DIR` (set by gc): where heartbeat files are
+  written. Falls back to `/tmp` when unset (e.g., when the script is
+  run outside of a city context for debugging).
 
 - The template list is hard-coded to `refinery polecat`. Adding witness
   is intentionally not done — witness has `min_active_sessions = 1` by
