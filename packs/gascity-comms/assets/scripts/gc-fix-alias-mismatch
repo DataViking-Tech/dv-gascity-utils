@@ -112,32 +112,60 @@ if [ ${#PACK_FILTER[@]} -gt 0 ]; then
     [ ${#PACKS[@]} -gt 0 ] || die "no packs matched filter: ${PACK_FILTER[*]}"
 fi
 
-# Detection pattern (POSIX ERE, used with grep -E).
-PATTERN_GREP='(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)([^A-Za-z0-9_-]|$)'
+# Two patterns are checked, with separate detection/rewrite pairs.
+#
+# (A) Templated short-form aliases — '<rig>/dog', '$GC_RIG/refinery',
+#     '{{ .RigName }}/witness', etc. Catches alias surfaces in formulas,
+#     prompts, and template fragments. (Tracking: dgu-fze, dgu-yykmt.)
+#
+# (B) Bare 'pool' field in order/formula TOMLs — 'pool = "dog"' where the
+#     supervisor's dispatch query expects 'pool = "gastown.dog"'. Same
+#     class of mismatch, different surface. (Tracking: mg-ovjgn.)
+#
+# (B) is intentionally NARROW: only matches the 'pool = "..."' line shape
+# at file start, not arbitrary 'pool' references. Keeps false-positive
+# risk minimal (gateway pool, polecat namepool, etc are unaffected).
 
-# Rewrite (Perl). Lookahead (?![\w-]) forbids alphanumerics, underscore,
+# (A) Detection pattern (POSIX ERE, used with grep -E).
+PATTERN_GREP_A='(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)([^A-Za-z0-9_-]|$)'
+
+# (A) Rewrite (Perl). Lookahead (?![\w-]) forbids alphanumerics, underscore,
 # AND hyphen after the role base name — this is what keeps us from
 # rewriting "polecat-name" or "polecats". Rig-token group includes the
 # three template surfaces we recognize. Replacement inserts "gastown."
 # before the role base name; the lookahead is zero-width so the trailing
 # context is preserved verbatim.
-PERL_REWRITE='s{(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)(?![\w-])}{$1/gastown.$2}g'
+PERL_REWRITE_A='s{(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)(?![\w-])}{$1/gastown.$2}g'
 
-INCLUDES=( --include='*.toml' --include='*.md' --include='*.template.md' )
+# (B) Detection pattern: 'pool = "<role>"' as a complete TOML key=value line.
+# Anchored to line start, allowing surrounding whitespace around '='.
+PATTERN_GREP_B='^pool[[:space:]]*=[[:space:]]*"(refinery|polecat|witness|dog)"[[:space:]]*$'
+
+# (B) Rewrite: insert 'gastown.' before the role inside the quoted value.
+# Captures whitespace around '=' to preserve formatting. Anchored, so we
+# don't touch other 'pool = "..."' fields embedded in larger expressions.
+PERL_REWRITE_B='s{^(pool[ \t]*=[ \t]*)"(refinery|polecat|witness|dog)"([ \t]*)$}{$1"gastown.$2"$3}'
+
+INCLUDES_A=( --include='*.toml' --include='*.md' --include='*.template.md' )
+INCLUDES_B=( --include='*.toml' )  # pool field only meaningful in TOML
 
 files_changed=0
 files_skipped=0
 total_changes=0
 
-for pack in "${PACKS[@]}"; do
-    pack_name="$(basename "$pack")"
-    pack_changed=0
+# Process pattern A then pattern B per pack. Files matching both get
+# touched twice — that's fine, perl rewrites are idempotent and the
+# patterns don't overlap (A operates on alias surfaces, B on bare pool
+# values). Using two passes keeps the per-pattern reporting accurate.
+process_pattern() {
+    local pack="$1" pack_name="$2" label="$3" pattern="$4" rewrite="$5"
+    shift 5
+    local includes=("$@")
 
     while IFS= read -r file; do
         [ -n "$file" ] || continue
 
-        # Count matches before rewrite (one finding ≈ one substitution).
-        before=$(grep -cE "$PATTERN_GREP" "$file" 2>/dev/null || true)
+        before=$(grep -cE "$pattern" "$file" 2>/dev/null || true)
         before="${before:-0}"
 
         if [ "$before" -eq 0 ]; then
@@ -148,33 +176,38 @@ for pack in "${PACKS[@]}"; do
         rel="${file#"$pack"/}"
 
         if [ "$DRY_RUN" -eq 1 ]; then
-            printf '  would fix [%d match(es)]: %s/%s\n' "$before" "$pack_name" "$rel"
+            printf '  would fix [%d match(es), pattern %s]: %s/%s\n' \
+                "$before" "$label" "$pack_name" "$rel"
             files_changed=$((files_changed + 1))
             total_changes=$((total_changes + before))
-            pack_changed=$((pack_changed + 1))
             continue
         fi
 
         # In-place rewrite via perl. -i without a backup suffix is fine here
         # because we always git-track these files; revert is a checkout away.
-        perl -i -pe "$PERL_REWRITE" "$file"
+        perl -i -pe "$rewrite" "$file"
 
-        # Confirm the rewrite actually eliminated the patterns.
-        after=$(grep -cE "$PATTERN_GREP" "$file" 2>/dev/null || true)
+        after=$(grep -cE "$pattern" "$file" 2>/dev/null || true)
         after="${after:-0}"
         applied=$((before - after))
 
         if [ "$applied" -le 0 ]; then
-            printf '  warn: no changes applied to %s/%s (pattern matched but rewrite did nothing)\n' \
-                "$pack_name" "$rel" >&2
+            printf '  warn: no changes applied to %s/%s for pattern %s (matched but rewrite did nothing)\n' \
+                "$pack_name" "$rel" "$label" >&2
             continue
         fi
 
-        printf '  fixed [%d substitution(s)]: %s/%s\n' "$applied" "$pack_name" "$rel"
+        printf '  fixed [%d substitution(s), pattern %s]: %s/%s\n' \
+            "$applied" "$label" "$pack_name" "$rel"
         files_changed=$((files_changed + 1))
         total_changes=$((total_changes + applied))
-        pack_changed=$((pack_changed + 1))
-    done < <(grep -rlE "${INCLUDES[@]}" "$PATTERN_GREP" "$pack" 2>/dev/null || true)
+    done < <(grep -rlE "${includes[@]}" "$pattern" "$pack" 2>/dev/null || true)
+}
+
+for pack in "${PACKS[@]}"; do
+    pack_name="$(basename "$pack")"
+    process_pattern "$pack" "$pack_name" "A" "$PATTERN_GREP_A" "$PERL_REWRITE_A" "${INCLUDES_A[@]}"
+    process_pattern "$pack" "$pack_name" "B" "$PATTERN_GREP_B" "$PERL_REWRITE_B" "${INCLUDES_B[@]}"
 done
 
 echo
