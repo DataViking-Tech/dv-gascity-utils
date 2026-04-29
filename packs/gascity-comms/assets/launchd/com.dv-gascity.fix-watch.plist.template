@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for gc-fix-watch (macOS).
+
+  Install:
+    1. Replace {{HOME}} with your absolute home path (e.g. /Users/openclaw).
+    2. Copy to ~/Library/LaunchAgents/com.dv-gascity.fix-watch.plist
+    3. launchctl load ~/Library/LaunchAgents/com.dv-gascity.fix-watch.plist
+    4. tail -f ~/Library/Logs/gc-fix-watch.log
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.dv-gascity.fix-watch.plist
+    rm ~/Library/LaunchAgents/com.dv-gascity.fix-watch.plist
+
+  This is a LaunchAgent (per-user), not a LaunchDaemon (system-wide). It
+  runs as the logged-in user and dies on logout. That matches how the
+  gc supervisor itself runs: there's no point auto-fixing pack files for
+  a supervisor that isn't running.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dv-gascity.fix-watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{HOME}}/.gc/bin/gc-fix-watch</string>
+        <string>--interval</string>
+        <string>30</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/Library/Logs/gc-fix-watch.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/Library/Logs/gc-fix-watch.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}</string>
+
+    <!-- Throttle: launchd otherwise restarts a crashing job every 1s. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
