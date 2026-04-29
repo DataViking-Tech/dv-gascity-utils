@@ -300,3 +300,153 @@ gc config explain --agent polecat --rig <rig> | grep min_active_sessions
 If the line says `# pack` instead of `# city.toml`, the override didn't
 land — re-run `gc-warm-rig-pool --dry-run <city.toml>` to see what would
 have changed.
+
+## Supervisor restart — caveats and workaround
+
+This section captures behavior observed on yggdrasil 2026-04-29 while
+diagnosing `mg-pfh96` / `dgu-pfh96` (dolt/orders/* dog orders permanently
+stuck after bd-error during dispatch).
+
+### When you'd reach for a restart
+
+The supervisor accumulates per-order broken-state guards when `bd create`
+or `bd list` fails during order dispatch (transient dolt connection EOF
+or circuit-breaker trip). Once flagged, that order never re-fires until
+the supervisor process restarts. Common symptom:
+
+- `mol-dog-doctor` (5m cadence) silent for hours/days while the dolt
+  server is healthy and the pool/poolDesired routing checks out.
+- `grep order.fired events.jsonl | grep mol-dog-doctor` shows no recent
+  fires; `grep mol-dog-doctor supervisor.log` shows old `bd create: exit
+  status 1` entries from one specific time window, then nothing.
+- mol-dog-jsonl + mol-dog-reaper (different pack family) keep firing
+  through the same window.
+
+A controlled supervisor restart unsticks every flagged order for **exactly
+one fire each**. They re-stick on the next bd-error. Documented as a
+Class C (gc binary) bug; no config-level fix until the binary stops
+persisting broken-state across cooldown ticks.
+
+### The "stop is broken" caveat
+
+`gc supervisor stop` may return `Supervisor stopping...` and then fail to
+actually stop the daemon. Observed on yg: a supervisor running 1d 19h
+with 944 min of accumulated CPU time **ignored SIGTERM entirely** — both
+via `gc supervisor stop` and direct `kill <pid>`. Twenty seconds of
+waiting saw no exit. Cause unknown but the workaround is reliable:
+SIGKILL.
+
+### Safe restart sequence
+
+```bash
+# 1. Capture pre-state.
+SUPERVISOR_PID=$(pgrep -f 'gc supervisor run' | head -1)
+echo "supervisor: PID=$SUPERVISOR_PID"
+ps -o pid,etime,command -p $SUPERVISOR_PID
+
+# 2. Try graceful stop first. Watch for actual exit, don't trust the
+#    return message.
+gc supervisor stop
+for i in 1 2 3 4 5; do
+    sleep 3
+    if ! kill -0 $SUPERVISOR_PID 2>/dev/null; then
+        echo "graceful stop completed"
+        break
+    fi
+done
+
+# 3. If still alive after ~15s, escalate.
+if kill -0 $SUPERVISOR_PID 2>/dev/null; then
+    echo "graceful stop ignored; sending SIGKILL"
+    kill -9 $SUPERVISOR_PID
+    sleep 3
+fi
+
+# 4. Verify launchd brought up a new supervisor.
+launchctl list | grep gascity.supervisor
+# expect: <new-pid>  0  com.gascity.supervisor
+
+# 5. If launchctl shows '-' for the PID (failed) or no entry at all,
+#    re-bootstrap. Observed on yg: the failed `gc supervisor stop`
+#    drifted launchd's view of the service to "registered but not
+#    running"; the next bootstrap call attempted to start a second
+#    supervisor that couldn't bind port 8372 because the orphan was
+#    still holding it.
+if [ -z "$(launchctl list | awk '/com\.gascity\.supervisor/ && $1 ~ /^[0-9]+$/{print $1}')" ]; then
+    launchctl bootout gui/$(id -u)/com.gascity.supervisor 2>/dev/null
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.supervisor.plist
+fi
+
+# 6. Confirm new supervisor is alive and serving.
+gc supervisor status
+lsof -i :8372 | head -2
+```
+
+### Post-restart checklist
+
+The supervisor's startup re-renders the embedded pack tree. Any in-place
+patches from `gc-fix-*` helpers get wiped. `gc-fix-watch` should detect
+this within its polling interval (default 30s) and re-apply, but it's
+worth confirming:
+
+```bash
+# Verify pool fields restored to canonical FQN form
+grep '^pool ' ~/<town>/.gc/system/packs/dolt/orders/mol-dog-*.toml
+# expect: pool = "gastown.dog" (not bare "dog")
+
+# If still bare, run helpers manually
+gc-fix-alias-mismatch ~/<town>
+gc-fix-merge-strategy ~/<town>
+```
+
+The dolt/orders/* dog orders should fire once each within ~5–15 min of
+pool-state stabilizing post-restart. Verify:
+
+```bash
+grep '"order.fired"' ~/<town>/.gc/events.jsonl \
+    | grep -E 'mol-dog-(doctor|stale-db|compactor)' \
+    | tail -5
+```
+
+If they DON'T fire after the pool is restored, either:
+- Pool wasn't actually canonicalized (re-check + re-run helpers)
+- Supervisor is still stuck (check supervisor.log for new `bd create:
+  exit status 1` entries)
+- The order's tracking-bead state in dolt is corrupt (open a fresh bug)
+
+### When NOT to restart
+
+`gc supervisor stop` (when it works) drops every agent across every rig
+and city. Blast radius:
+
+- Witnesses, refineries, deacons, polecats — all drained
+- Active polecat work loses its session (worktree preserved on disk;
+  bead state preserved in dolt)
+- In-flight `gc mail` operations may fail until the new supervisor binds
+- Cross-city peers will see this host's gateway return errors briefly
+
+Restart is appropriate for:
+- A specific known-stuck condition like `mg-pfh96` / `dgu-pfh96`
+- A human-driven maintenance window
+- After a binary upgrade
+
+It is NOT appropriate as a routine fix for transient issues. Filing the
+underlying bug (Class C) and waiting for a binary fix is the durable path.
+
+### Verified test result (yg, 2026-04-29)
+
+Timeline:
+
+| Time (UTC)     | Event                                                                |
+|----------------|----------------------------------------------------------------------|
+| `T-0`          | `gc supervisor stop` invoked. Returns `Supervisor stopping...`       |
+| `T+5s`         | Process still alive (PID held port 8372). SIGTERM ignored.           |
+| `T+20s`        | Still alive. SIGKILL applied.                                        |
+| `T+22s`        | Old PID reaped. launchd KeepAlive spawned new supervisor.            |
+| `T+30s`        | Templater wipe detected: pool `gastown.dog` reverted to bare `dog`.  |
+| `T+1m`         | `gc-fix-alias-mismatch` re-applied; pool `gastown.dog` stable.       |
+| `T+6m30s`      | `mol-dog-compactor`, `mol-dog-doctor`, `mol-dog-stale-db` each fire ONCE. |
+| `T+11m`        | `mol-dog-doctor`'s next 5-min cooldown elapses. NO fire. Order re-stuck. |
+
+Confirms the diagnosis exactly: restart unsticks for one fire each;
+broken-state guard re-traps after the next bd-error.
