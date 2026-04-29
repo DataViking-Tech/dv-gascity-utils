@@ -150,6 +150,20 @@ Replace `<rig>/refinery` with `<rig>/gastown.refinery` (template-rendered as `{{
 
 Confidence is high that this is sufficient: the polecat pool uses exactly this convention and its `work_requested` count is non-zero. No reconciler/controller change is required — only the formula and two prompt templates. Tracking bead: `dgu-fze`.
 
+## Sister bug: refinery → polecat rejection bounce
+
+The same alias-mismatch class hits the reverse direction. In `mol-refinery-patrol.toml`, step `rebase`, the conflict-rejection branch writes:
+
+```bash
+gc bd update $WORK \
+  --set-metadata rejection_reason="..." \
+  --set-metadata gc.routed_to=<rig>/polecat   # short form — polecat pool query misses it
+```
+
+For `dv-gascity-utils` that expands to `gc.routed_to=dv-gascity-utils/polecat`. Polecats with the patched claim query (`gc.routed_to=dv-gascity-utils/gastown.polecat`) miss the bounced bead, so a rejected branch sits invisible until mayor notices and SQL-fixes the routing. Observed live with bead `dgu-yxb8` on 2026-04-28.
+
+Same fix: full-form `<rig>/gastown.polecat`. The `gc-fix-refinery-routing` helper now patches this fourth call-site in addition to the original three (so polecat→refinery and refinery→polecat handoffs realign together). Tracking bead: `dgu-wrdjs`.
+
 ## Reference: what the trace says
 
 ```bash
