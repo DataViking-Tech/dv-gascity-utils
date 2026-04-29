@@ -50,4 +50,18 @@ cp ~/dv-gascity-utils/packs/gascity-comms/assets/templates/peers.toml.template ~
 # fill in url + token_file for each peer
 ```
 
+The `gc-fix-*` helpers are one-shot patchers, not ambient daemons —
+symlinking only puts them on `$PATH`. After the symlinks land, run each
+once on this host so the per-host gastown system pack picks up the
+fixes:
+
+```bash
+gc-fix-alias-mismatch ~/<town>     # or just `gc-fix-alias-mismatch` to scan ~/*
+gc-fix-merge-strategy ~/<town>
+```
+
+Both are idempotent — re-runs report `already fixed`. See
+`docs/alias-canonicalization.md` and `docs/rig-merge-strategy.md` for
+what each one rewrites and why.
+
 Tokens stay outside the pack (per-host, mode 0600 in `~/.gc/tokens/`). `peers.toml` stays per-host.
