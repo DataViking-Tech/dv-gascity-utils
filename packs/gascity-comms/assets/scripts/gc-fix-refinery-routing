@@ -1,153 +1,34 @@
 #!/usr/bin/env bash
-# gc-fix-refinery-routing — align role-routing aliases to <rig>/gastown.<role>.
+# gc-fix-refinery-routing — DEPRECATED. Forwards to gc-fix-alias-mismatch.
 #
-# The gastown pack templates write SHORT-FORM agent aliases (<rig>/refinery,
-# <rig>/polecat) on assignee/routed_to fields. The reconciler's namedWorkReady
-# check matches against the FULL template name (<rig>/gastown.refinery,
-# <rig>/gastown.polecat — rig prefix + 'gastown.' namespace + agent base), so
-# the targeted on-demand slot never wakes and the bead sits invisible.
-# (Tracking beads: dgu-fze for the polecat→refinery handoff,
-# dgu-wrdjs for the refinery→polecat rejection bounce; root-cause writeup:
-# dv-gascity-utils/docs/refinery-materialization.md, dgu-3u9.)
+# The original helper only fixed three (later four) files in the gastown
+# pack and missed every other template that emits short-form aliases —
+# witness/refinery patrol formulas, mayor/deacon/crew prompts,
+# mol-idea-to-plan, and so on. gc-fix-alias-mismatch is the generalized
+# replacement: same idempotency guarantees, full coverage of every
+# templated alias surface across every installed system pack.
 #
-# This helper rewrites every templated routing call-site in every gastown
-# system pack found on this host. Each town's `.gc/system/packs/gastown/` is
-# a runtime copy that is not in any git repo, so the only authoritative way
-# to apply the fix locally is in-place.
+# Tracking history:
+#   - dgu-fze: original 3-file helper for the polecat -> refinery handoff.
+#   - dgu-wrdjs: extended to a 4th file for the refinery -> polecat
+#     rejection bounce. (Same alias-mismatch class.)
+#   - dgu-yykmt: replaced this helper with the generalized audit + fixer
+#     and turned this script into a shim.
 #
-# Files touched per pack (skipped silently if absent):
-#   formulas/mol-polecat-work.toml          (polecat → refinery handoff)
-#   agents/polecat/prompt.template.md       (polecat → refinery handoff)
-#   template-fragments/approval-fallacy.template.md  (polecat → refinery handoff)
-#   formulas/mol-refinery-patrol.toml       (refinery → polecat rejection bounce)
-#
-# Idempotent: detects the old pattern with grep -F before editing and is safe
-# to re-run. Fixed packs report "already fixed".
+# This shim preserves the old name so already-symlinked invocations keep
+# working. Any positional args are forwarded as-is. New scripts and docs
+# should call gc-fix-alias-mismatch directly.
 
 set -euo pipefail
 
-usage() {
-    cat <<'EOF'
-gc-fix-refinery-routing — align role-routing aliases to <rig>/gastown.<role>.
+echo "gc-fix-refinery-routing: deprecated — forwarding to gc-fix-alias-mismatch" >&2
 
-Usage:
-  gc-fix-refinery-routing [options] [town-root ...]
+here="$(cd "$(dirname "$0")" && pwd)"
+target="$here/gc-fix-alias-mismatch"
 
-Default scan: every $HOME/<town>/.gc/system/packs/gastown that exists.
-Pass explicit town-root paths as positional args to override discovery.
-
-Patches both directions of the polecat↔refinery handoff:
-  • polecat → refinery (done-sequence; dgu-fze)
-  • refinery → polecat (rejection bounce; dgu-wrdjs)
-
-Options:
-  --dry-run     Show what would change; touch nothing.
-  -h, --help    Show this help.
-
-Examples:
-  gc-fix-refinery-routing                       # scan ~/* and fix every gastown pack
-  gc-fix-refinery-routing --dry-run             # preview without writing
-  gc-fix-refinery-routing ~/yggdrasil ~/asgard  # explicit roots
-EOF
-}
-
-DRY_RUN=0
-ROOTS=()
-
-die() { echo "gc-fix-refinery-routing: $*" >&2; exit 1; }
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -h|--help) usage; exit 0 ;;
-        --dry-run) DRY_RUN=1; shift ;;
-        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
-        -*) die "unknown option: $1" ;;
-        *) ROOTS+=("$1"); shift ;;
-    esac
-done
-
-if [ ${#ROOTS[@]} -eq 0 ]; then
-    for d in "$HOME"/*; do
-        [ -d "$d/.gc/system/packs/gastown" ] && ROOTS+=("$d")
-    done
+if [ ! -x "$target" ]; then
+    echo "gc-fix-refinery-routing: gc-fix-alias-mismatch not found at $target" >&2
+    exit 2
 fi
 
-[ ${#ROOTS[@]} -gt 0 ] || die "no gastown system packs found under $HOME/*; pass explicit roots"
-
-# rewrite_file <file> <bad-pattern-fixed> <sed-pattern1> <sed-replace1> [<sed-pattern2> <sed-replace2>]
-# - bad-pattern-fixed: a literal substring (grep -F) that, if present, means the file still
-#   needs the fix. If absent, file is skipped as already-fixed.
-# - sed args use '|' as the s-delimiter so '/' in patterns is unescaped.
-rewrite_file() {
-    local file="$1" needle="$2"; shift 2
-    if [ ! -f "$file" ]; then
-        echo "    skip (missing): ${file#$HOME/}"
-        return
-    fi
-    if ! grep -qF -- "$needle" "$file"; then
-        echo "    ok (already fixed): ${file#$HOME/}"
-        return
-    fi
-    if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    would edit: ${file#$HOME/}"
-        return
-    fi
-    local sed_args=()
-    while [ $# -gt 0 ]; do
-        sed_args+=( -e "s|$1|$2|g" )
-        shift 2
-    done
-    sed -i.bak "${sed_args[@]}" "$file"
-    rm -f "${file}.bak"
-    echo "    fixed: ${file#$HOME/}"
-}
-
-fix_pack() {
-    local pack="$1"
-    echo "  ${pack#$HOME/}:"
-
-    # 1. mol-polecat-work.toml uses literal <rig>/refinery placeholder.
-    rewrite_file "$pack/formulas/mol-polecat-work.toml" \
-        '<rig>/refinery' \
-        '--assignee=<rig>/refinery' '--assignee=<rig>/gastown.refinery' \
-        'gc\.routed_to=<rig>/refinery' 'gc.routed_to=<rig>/gastown.refinery'
-
-    # 2. polecat agent prompt uses Go template {{ .RigName }}.
-    rewrite_file "$pack/agents/polecat/prompt.template.md" \
-        '{{ .RigName }}/refinery' \
-        '--assignee={{ \.RigName }}/refinery' '--assignee={{ .RigName }}/gastown.refinery' \
-        'gc\.routed_to={{ \.RigName }}/refinery' 'gc.routed_to={{ .RigName }}/gastown.refinery'
-
-    # 3. approval-fallacy fragment duplicates the same template snippet.
-    rewrite_file "$pack/template-fragments/approval-fallacy.template.md" \
-        '{{ .RigName }}/refinery' \
-        '--assignee={{ \.RigName }}/refinery' '--assignee={{ .RigName }}/gastown.refinery' \
-        'gc\.routed_to={{ \.RigName }}/refinery' 'gc.routed_to={{ .RigName }}/gastown.refinery'
-
-    # 4. mol-refinery-patrol.toml writes routed_to on rejection bounce
-    #    (rebase-conflict path). Same class as #1 but in the reverse direction:
-    #    refinery → polecat. (dgu-wrdjs)
-    rewrite_file "$pack/formulas/mol-refinery-patrol.toml" \
-        'gc.routed_to=<rig>/polecat' \
-        'gc\.routed_to=<rig>/polecat' 'gc.routed_to=<rig>/gastown.polecat'
-}
-
-echo "Scanning ${#ROOTS[@]} root(s):"
-for r in "${ROOTS[@]}"; do echo "  $r"; done
-echo
-
-for r in "${ROOTS[@]}"; do
-    pack="$r/.gc/system/packs/gastown"
-    if [ ! -d "$pack" ]; then
-        echo "[$r] no gastown pack — skipping"
-        continue
-    fi
-    fix_pack "$pack"
-done
-
-echo
-if [ "$DRY_RUN" -eq 1 ]; then
-    echo "dry-run complete; no files were changed"
-else
-    echo "done. Re-run safely; subsequent runs report 'already fixed'."
-fi
+exec "$target" "$@"

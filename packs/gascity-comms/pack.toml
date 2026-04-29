@@ -12,11 +12,14 @@
 #       - Runs `gc rig add --adopt --prefix <p>` so the second city joins instead
 #         of forking a duplicate prefix database
 #       See dv-gascity-utils/docs/shared-rig-prefix.md for the design.
-#   - gc-fix-refinery-routing, the polecat done-sequence assignee fix:
-#       - Patches the gastown system pack so polecats reassign work beads to
-#         '<rig>/gastown.refinery' (the namedWorkReady-resolvable form),
-#         not the short '<rig>/refinery' that leaves the on-demand refinery
-#         slot dormant.
+#   - gc-audit-alias-mismatch + gc-fix-alias-mismatch: detect and rewrite
+#     short-form agent aliases (<rig>/refinery) to canonical
+#     <rig>/gastown.<role> across installed system packs. Run after pack
+#     installation or any `gc reload` that resets pack state. Pairs with
+#     a doctor check (doctor/check-alias-mismatch) that surfaces drift.
+#     Supersedes the narrower gc-fix-refinery-routing, which is preserved
+#     as a deprecation shim that forwards to gc-fix-alias-mismatch.
+#     See dv-gascity-utils/docs/alias-canonicalization.md.
 #   - gc-fix-merge-strategy, the polecat PR-protected branch fix:
 #       - Patches the polecat submit-and-exit step to auto-detect branch
 #         protection via `gh api repos/<r>/branches/<t>` and set
@@ -45,13 +48,17 @@
 #   1. Symlink the wrappers:
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gcx ~/.gc/bin/gcx
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-rig-join ~/.gc/bin/gc-rig-join
-#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-refinery-routing ~/.gc/bin/gc-fix-refinery-routing
+#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-audit-alias-mismatch ~/.gc/bin/gc-audit-alias-mismatch
+#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-alias-mismatch ~/.gc/bin/gc-fix-alias-mismatch
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-merge-strategy ~/.gc/bin/gc-fix-merge-strategy
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-tune-refinery-loop ~/.gc/bin/gc-tune-refinery-loop
 #   2. Initialize the per-host peer registry:
 #        cp {{ConfigDir}}/system/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
 #      then fill in url + token_file for each peer the host should reach.
-#   3. Run `gc-fix-merge-strategy` once to install the auto-detect logic
+#   3. Run `gc-fix-alias-mismatch` once to canonicalize alias references in
+#      this host's installed system packs (and re-run after any `gc reload`
+#      that resets pack state — see docs/alias-canonicalization.md).
+#   4. Run `gc-fix-merge-strategy` once to install the auto-detect logic
 #      into this host's gastown system pack.
 #   4. Run `gc-tune-refinery-loop` once to bound refinery find-work latency
 #      to ~60s on this host's gastown system pack.

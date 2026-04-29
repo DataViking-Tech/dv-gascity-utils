@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# gc-fix-alias-mismatch — rewrite short-form agent aliases to canonical
+# <rig>/gastown.<role> form across pack templates.
+#
+# WHAT this fixes:
+#   Pack templates that emit <rig>/<role> (or {{ .RigName }}/<role> or
+#   $GC_RIG/<role>) where the reconciler expects the FULL pack-prefixed
+#   agent name <rig>/gastown.<role>. The mismatch causes silent routing
+#   failures: assignments and pool-routing labels never match a real
+#   agent slot, so on-demand sessions never wake. (Tracking: dgu-fze,
+#   dgu-3u9, dgu-wrdjs, dgu-yykmt.)
+#
+# Idempotent. Replaces and supersedes the narrower gc-fix-refinery-routing
+# (which only patched 3 files in the gastown pack). This helper covers
+# every templated alias surface the audit knows about.
+#
+# Pair with gc-audit-alias-mismatch (read-only) to confirm coverage before
+# and after running the fixer.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-alias-mismatch — rewrite short-form aliases to <rig>/gastown.<role>.
+
+Usage:
+  gc-fix-alias-mismatch [options] [pack-or-town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/<pack>/ that exists.
+Pass explicit pack roots OR town roots as positional args to override.
+
+Options:
+  --dry-run       Show what would change; touch nothing.
+  --pack=<name>   Only fix packs whose basename equals <name> (repeatable).
+                  Default: every discovered pack.
+  -h, --help      Show this help.
+
+Examples:
+  gc-fix-alias-mismatch                       # fix every host pack
+  gc-fix-alias-mismatch --dry-run             # preview without writing
+  gc-fix-alias-mismatch ~/yggdrasil           # one town's packs
+  gc-fix-alias-mismatch --pack=gastown        # only the gastown pack
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+PACK_FILTER=()
+
+die() { echo "gc-fix-alias-mismatch: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --pack=*) PACK_FILTER+=("${1#--pack=}"); shift ;;
+        --pack)
+            shift
+            [ $# -gt 0 ] || die "--pack requires an argument"
+            PACK_FILTER+=("$1"); shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+# perl is required for the in-place rewrite (POSIX sed lacks portable
+# negative lookahead, and we need precise role-boundary handling).
+command -v perl >/dev/null 2>&1 || die "perl is required but not installed"
+
+expand_roots() {
+    local r
+    PACKS=()
+    for r in "$@"; do
+        if [ -d "$r/.gc/system/packs" ]; then
+            for p in "$r"/.gc/system/packs/*; do
+                [ -d "$p" ] && PACKS+=("$p")
+            done
+        elif [ -f "$r/pack.toml" ]; then
+            PACKS+=("$r")
+        else
+            die "not a pack root or town root: $r"
+        fi
+    done
+}
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs" ] && ROOTS+=("$d")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || die "no .gc/system/packs trees found under $HOME/*; pass an explicit root"
+fi
+
+PACKS=()
+expand_roots "${ROOTS[@]}"
+
+[ ${#PACKS[@]} -gt 0 ] || die "no packs found under the given roots"
+
+# Apply pack filter if any --pack=<name> were given.
+if [ ${#PACK_FILTER[@]} -gt 0 ]; then
+    FILTERED=()
+    for p in "${PACKS[@]}"; do
+        bn="$(basename "$p")"
+        for f in "${PACK_FILTER[@]}"; do
+            if [ "$bn" = "$f" ]; then
+                FILTERED+=("$p")
+                break
+            fi
+        done
+    done
+    PACKS=("${FILTERED[@]}")
+    [ ${#PACKS[@]} -gt 0 ] || die "no packs matched filter: ${PACK_FILTER[*]}"
+fi
+
+# Detection pattern (POSIX ERE, used with grep -E).
+PATTERN_GREP='(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)([^A-Za-z0-9_-]|$)'
+
+# Rewrite (Perl). Lookahead (?![\w-]) forbids alphanumerics, underscore,
+# AND hyphen after the role base name — this is what keeps us from
+# rewriting "polecat-name" or "polecats". Rig-token group includes the
+# three template surfaces we recognize. Replacement inserts "gastown."
+# before the role base name; the lookahead is zero-width so the trailing
+# context is preserved verbatim.
+PERL_REWRITE='s{(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)(?![\w-])}{$1/gastown.$2}g'
+
+INCLUDES=( --include='*.toml' --include='*.md' --include='*.template.md' )
+
+files_changed=0
+files_skipped=0
+total_changes=0
+
+for pack in "${PACKS[@]}"; do
+    pack_name="$(basename "$pack")"
+    pack_changed=0
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+
+        # Count matches before rewrite (one finding ≈ one substitution).
+        before=$(grep -cE "$PATTERN_GREP" "$file" 2>/dev/null || true)
+        before="${before:-0}"
+
+        if [ "$before" -eq 0 ]; then
+            files_skipped=$((files_skipped + 1))
+            continue
+        fi
+
+        rel="${file#"$pack"/}"
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '  would fix [%d match(es)]: %s/%s\n' "$before" "$pack_name" "$rel"
+            files_changed=$((files_changed + 1))
+            total_changes=$((total_changes + before))
+            pack_changed=$((pack_changed + 1))
+            continue
+        fi
+
+        # In-place rewrite via perl. -i without a backup suffix is fine here
+        # because we always git-track these files; revert is a checkout away.
+        perl -i -pe "$PERL_REWRITE" "$file"
+
+        # Confirm the rewrite actually eliminated the patterns.
+        after=$(grep -cE "$PATTERN_GREP" "$file" 2>/dev/null || true)
+        after="${after:-0}"
+        applied=$((before - after))
+
+        if [ "$applied" -le 0 ]; then
+            printf '  warn: no changes applied to %s/%s (pattern matched but rewrite did nothing)\n' \
+                "$pack_name" "$rel" >&2
+            continue
+        fi
+
+        printf '  fixed [%d substitution(s)]: %s/%s\n' "$applied" "$pack_name" "$rel"
+        files_changed=$((files_changed + 1))
+        total_changes=$((total_changes + applied))
+        pack_changed=$((pack_changed + 1))
+    done < <(grep -rlE "${INCLUDES[@]}" "$PATTERN_GREP" "$pack" 2>/dev/null || true)
+done
+
+echo
+if [ "$total_changes" -eq 0 ]; then
+    printf 'gc-fix-alias-mismatch: %d pack(s) scanned, no short-form patterns found.\n' "${#PACKS[@]}"
+    exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'gc-fix-alias-mismatch: %d substitution(s) across %d file(s) would be applied. Re-run without --dry-run to apply.\n' \
+        "$total_changes" "$files_changed"
+else
+    printf 'gc-fix-alias-mismatch: %d substitution(s) across %d file(s).\n' \
+        "$total_changes" "$files_changed"
+    echo "Re-run gc-audit-alias-mismatch to verify; subsequent runs report 'no findings'."
+fi

@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# gc-audit-alias-mismatch — find short-form agent alias mismatches across packs.
+#
+# WHY this exists:
+#   The reconciler's namedWorkReady check matches assignees against the FULL
+#   pack-prefixed agent name (e.g. <rig>/gastown.refinery, with both rig
+#   prefix AND the gastown.* namespace). Templates that emit SHORT-form
+#   aliases (<rig>/refinery) at runtime cause silent routing failures: the
+#   on-demand agent slot never wakes, beads sit unmerged or unworked, and
+#   the only sign is "poolDesired" log lines that never fire. (Tracking:
+#   dgu-fze, dgu-3u9, dgu-wrdjs, dgu-yykmt.)
+#
+# WHAT this finds:
+#   Anywhere a pack template emits the wrong alias form. Three rig-token
+#   variants are recognized (the canonical surface used in this codebase):
+#     <rig>           - literal placeholder in formula bodies + agent prompts
+#     {{ .RigName }}  - Go template variable, substituted at prompt-render time
+#     $GC_RIG         - shell variable used inside formula step scripts
+#   Followed by /<role> where role is one of the gastown agent base names
+#   (refinery, polecat, witness, dog) and NOT already prefixed gastown.*.
+#
+# Read-only. Pair with gc-fix-alias-mismatch to actually rewrite files.
+#
+# Exit codes:
+#   0 - no short-form findings (clean)
+#   1 - findings present (suitable for CI gating)
+#   2 - usage / invocation error
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-audit-alias-mismatch — find short-form agent alias mismatches across packs.
+
+Usage:
+  gc-audit-alias-mismatch [options] [pack-or-town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/<pack>/ that exists.
+Pass explicit pack roots OR town roots as positional args to override.
+
+Options:
+  --quiet         Only print summary line; suppress per-finding output.
+  --json          Emit findings as one JSON object per line.
+  --no-fail       Always exit 0, even when findings are present.
+  -h, --help      Show this help.
+
+Exit codes:
+  0 = clean (no findings)
+  1 = findings present
+  2 = invocation error
+
+Examples:
+  gc-audit-alias-mismatch                 # scan every host pack
+  gc-audit-alias-mismatch ~/yggdrasil     # scan one town's packs
+  gc-audit-alias-mismatch --json | jq .   # machine-readable output
+  gc-audit-alias-mismatch --no-fail       # report-only, never fail
+EOF
+}
+
+QUIET=0
+JSON=0
+NO_FAIL=0
+ROOTS=()
+
+die() { echo "gc-audit-alias-mismatch: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --quiet) QUIET=1; shift ;;
+        --json) JSON=1; shift ;;
+        --no-fail) NO_FAIL=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+# Discovery: distinguish between explicit pack roots and town roots.
+#   - A "pack root" contains pack.toml directly.
+#   - A "town root" contains .gc/system/packs/* (one or more pack roots).
+# Default (no args): walk every town under $HOME and collect pack roots.
+expand_roots() {
+    local r
+    PACKS=()
+    for r in "$@"; do
+        # Town root takes precedence over pack root: a town's top-level
+        # pack.toml is the town manifest, not a pack we want to scan.
+        # Always prefer the .gc/system/packs/ tree if present.
+        if [ -d "$r/.gc/system/packs" ]; then
+            for p in "$r"/.gc/system/packs/*; do
+                [ -d "$p" ] && PACKS+=("$p")
+            done
+        elif [ -f "$r/pack.toml" ]; then
+            PACKS+=("$r")
+        else
+            die "not a pack root or town root: $r"
+        fi
+    done
+}
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs" ] && ROOTS+=("$d")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || die "no .gc/system/packs trees found under $HOME/*; pass an explicit root"
+fi
+
+PACKS=()
+expand_roots "${ROOTS[@]}"
+
+[ ${#PACKS[@]} -gt 0 ] || die "no packs found under the given roots"
+
+# The pattern (POSIX ERE; combined branch for inline and end-of-line context):
+#   group 1: rig token (<rig> | {{ .RigName }} | $GC_RIG)
+#   group 2: role base name (refinery|polecat|witness|dog)
+#   group 3: trailing context — non-word/non-hyphen, OR end-of-line
+#
+# The trailing context is what keeps us from flagging:
+#   - polecats (plural)         next char is alphanumeric
+#   - polecat-name              next char is hyphen
+#   - {{.Rig}} (path token)     pattern requires .RigName, not .Rig
+#
+# Already-canonical forms <rig>/gastown.refinery don't match because the
+# slash-separated segment after / starts with "gastown." not the bare role.
+PATTERN='(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)([^A-Za-z0-9_-]|$)'
+
+# Scope filter: include only files that can plausibly carry alias references.
+INCLUDES=( --include='*.toml' --include='*.md' --include='*.template.md' )
+
+found_total=0
+
+# Parallel arrays for per-pack counts (bash 3.2 compatible — no associative
+# arrays). PACK_NAMES[i] maps to PACK_COUNTS[i].
+PACK_NAMES=()
+PACK_COUNTS=()
+
+for pack in "${PACKS[@]}"; do
+    pack_name="$(basename "$pack")"
+    pack_count=0
+
+    # grep -n -E -H over the pack tree; tolerate empty/missing dirs.
+    while IFS= read -r line; do
+        # grep output: <file>:<line-no>:<matched-line-text>
+        file="${line%%:*}"; rest="${line#*:}"
+        lineno="${rest%%:*}"; matched="${rest#*:}"
+
+        # Extract only the matched span for the suggested-fix output. We
+        # know there is exactly one short-form per matched line in practice;
+        # if multiple exist we still suggest the first one (rare; the fixer
+        # rewrites all occurrences via sed regardless).
+        match=$(printf '%s\n' "$matched" | grep -oE "$PATTERN" | head -n1 || true)
+        # Strip any trailing context char from the match (we only want the
+        # alias span, not the boundary char that anchored the match).
+        alias_span=$(printf '%s' "$match" | sed -E 's/[^A-Za-z0-9_$}>-]$//')
+        suggested=$(printf '%s' "$alias_span" | sed -E 's~/(refinery|polecat|witness|dog)$~/gastown.\1~')
+
+        rel="${file#"$pack"/}"
+
+        if [ "$JSON" -eq 1 ]; then
+            # Hand-rolled JSON: pack/file paths are ASCII; no escaping needed
+            # for the role + token vocabulary we control.
+            printf '{"pack":"%s","file":"%s","line":%s,"match":"%s","suggested":"%s"}\n' \
+                "$pack_name" "$rel" "$lineno" "$alias_span" "$suggested"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf '  %s/%s:%s\n' "$pack_name" "$rel" "$lineno"
+            printf '    -- %s\n' "$alias_span"
+            printf '    ++ %s\n' "$suggested"
+        fi
+
+        found_total=$((found_total + 1))
+        pack_count=$((pack_count + 1))
+    done < <(grep -rn -E "${INCLUDES[@]}" "$PATTERN" "$pack" 2>/dev/null || true)
+
+    PACK_NAMES+=("$pack_name")
+    PACK_COUNTS+=("$pack_count")
+done
+
+if [ "$JSON" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    echo
+    if [ "$found_total" -eq 0 ]; then
+        printf 'gc-audit-alias-mismatch: %d pack(s) scanned, no short-form findings.\n' "${#PACKS[@]}"
+    else
+        printf 'gc-audit-alias-mismatch: %d finding(s) across %d pack(s):\n' \
+            "$found_total" "${#PACKS[@]}"
+        for i in "${!PACK_NAMES[@]}"; do
+            count="${PACK_COUNTS[$i]}"
+            [ "$count" -gt 0 ] && printf '  %s: %d\n' "${PACK_NAMES[$i]}" "$count"
+        done
+        echo
+        echo "Run gc-fix-alias-mismatch [--dry-run] to apply canonical replacements."
+    fi
+fi
+
+if [ "$NO_FAIL" -eq 1 ]; then
+    exit 0
+fi
+[ "$found_total" -eq 0 ] && exit 0 || exit 1
