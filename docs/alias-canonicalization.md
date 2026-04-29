@@ -138,12 +138,18 @@ Anchored to line start and end, so the rewrite is intentionally NARROW:
 
 Scope is limited to `*.toml` (the `pool` field has no meaning in `.md`).
 
-The audit script (`gc-audit-alias-mismatch`) does NOT yet flag pattern B
-findings — extension pending. For now, dry-run the fixer to see them:
+Both `gc-audit-alias-mismatch` (read-only) and `gc-fix-alias-mismatch`
+(rewrite) flag pattern B findings. Audit output tags each finding with
+its pattern label:
 
-```bash
-gc-fix-alias-mismatch --dry-run | grep 'pattern B'
 ```
+dolt/orders/mol-dog-doctor.toml:6 [pattern B]
+  -- pool = "dog"
+  ++ pool = "gastown.dog"
+```
+
+JSON mode (`--json`) emits a `"pattern":"A"` or `"pattern":"B"` field
+per finding for downstream tooling.
 
 ## Doctor check
 

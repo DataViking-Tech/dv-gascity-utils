@@ -123,10 +123,27 @@ expand_roots "${ROOTS[@]}"
 #
 # Already-canonical forms <rig>/gastown.refinery don't match because the
 # slash-separated segment after / starts with "gastown." not the bare role.
-PATTERN='(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)([^A-Za-z0-9_-]|$)'
+# Two patterns are flagged separately so report output stays diagnosable.
+#
+# (A) Templated short-form aliases — '<rig>/dog', '$GC_RIG/refinery',
+#     '{{ .RigName }}/witness'. Matches in formulas, prompts, and template
+#     fragments. Fixer rewrites by inserting 'gastown.' before the role.
+#
+# (B) Bare 'pool' field in order/formula TOMLs — 'pool = "dog"' where
+#     supervisor's dispatch query expects 'pool = "gastown.dog"'. Same
+#     class of mismatch, different surface. (Tracking: mg-ovjgn.)
+#
+# Pattern B is intentionally NARROW: anchored start-and-end, only the
+# bare 'pool = "..."' shape, only on .toml. Doesn't touch 'pool: <rig>/dog'
+# (handled by A), gateway_pool, polecat_namepool, or other 'pool' refs.
 
-# Scope filter: include only files that can plausibly carry alias references.
-INCLUDES=( --include='*.toml' --include='*.md' --include='*.template.md' )
+PATTERN_A='(<rig>|\{\{ *\.RigName *\}\}|\$GC_RIG)/(refinery|polecat|witness|dog)([^A-Za-z0-9_-]|$)'
+PATTERN_B='^pool[[:space:]]*=[[:space:]]*"(refinery|polecat|witness|dog)"[[:space:]]*$'
+
+# Scope filters per pattern. (A) covers alias references generally;
+# (B) is .toml-only because the 'pool' field has no meaning elsewhere.
+INCLUDES_A=( --include='*.toml' --include='*.md' --include='*.template.md' )
+INCLUDES_B=( --include='*.toml' )
 
 found_total=0
 
@@ -135,42 +152,61 @@ found_total=0
 PACK_NAMES=()
 PACK_COUNTS=()
 
+# emit_finding — formats one finding (JSON or human-readable) and updates
+# the running totals. Used by both pattern passes.
+emit_finding() {
+    local pack_name="$1" rel="$2" lineno="$3" alias_span="$4" suggested="$5" pattern_label="$6"
+
+    if [ "$JSON" -eq 1 ]; then
+        # Hand-rolled JSON: pack/file paths are ASCII; no escaping needed
+        # for the role + token vocabulary we control.
+        printf '{"pack":"%s","file":"%s","line":%s,"match":"%s","suggested":"%s","pattern":"%s"}\n' \
+            "$pack_name" "$rel" "$lineno" "$alias_span" "$suggested" "$pattern_label"
+    elif [ "$QUIET" -eq 0 ]; then
+        printf '  %s/%s:%s [pattern %s]\n' "$pack_name" "$rel" "$lineno" "$pattern_label"
+        printf '    -- %s\n' "$alias_span"
+        printf '    ++ %s\n' "$suggested"
+    fi
+}
+
 for pack in "${PACKS[@]}"; do
     pack_name="$(basename "$pack")"
     pack_count=0
 
-    # grep -n -E -H over the pack tree; tolerate empty/missing dirs.
+    # ----- Pattern A: templated short-form aliases -----
     while IFS= read -r line; do
-        # grep output: <file>:<line-no>:<matched-line-text>
         file="${line%%:*}"; rest="${line#*:}"
         lineno="${rest%%:*}"; matched="${rest#*:}"
 
-        # Extract only the matched span for the suggested-fix output. We
-        # know there is exactly one short-form per matched line in practice;
-        # if multiple exist we still suggest the first one (rare; the fixer
-        # rewrites all occurrences via sed regardless).
-        match=$(printf '%s\n' "$matched" | grep -oE "$PATTERN" | head -n1 || true)
-        # Strip any trailing context char from the match (we only want the
-        # alias span, not the boundary char that anchored the match).
+        # Extract the matched alias span (one per line in practice).
+        match=$(printf '%s\n' "$matched" | grep -oE "$PATTERN_A" | head -n1 || true)
+        # Strip trailing boundary char; we only want the alias text.
         alias_span=$(printf '%s' "$match" | sed -E 's/[^A-Za-z0-9_$}>-]$//')
         suggested=$(printf '%s' "$alias_span" | sed -E 's~/(refinery|polecat|witness|dog)$~/gastown.\1~')
 
         rel="${file#"$pack"/}"
-
-        if [ "$JSON" -eq 1 ]; then
-            # Hand-rolled JSON: pack/file paths are ASCII; no escaping needed
-            # for the role + token vocabulary we control.
-            printf '{"pack":"%s","file":"%s","line":%s,"match":"%s","suggested":"%s"}\n' \
-                "$pack_name" "$rel" "$lineno" "$alias_span" "$suggested"
-        elif [ "$QUIET" -eq 0 ]; then
-            printf '  %s/%s:%s\n' "$pack_name" "$rel" "$lineno"
-            printf '    -- %s\n' "$alias_span"
-            printf '    ++ %s\n' "$suggested"
-        fi
+        emit_finding "$pack_name" "$rel" "$lineno" "$alias_span" "$suggested" "A"
 
         found_total=$((found_total + 1))
         pack_count=$((pack_count + 1))
-    done < <(grep -rn -E "${INCLUDES[@]}" "$PATTERN" "$pack" 2>/dev/null || true)
+    done < <(grep -rn -E "${INCLUDES_A[@]}" "$PATTERN_A" "$pack" 2>/dev/null || true)
+
+    # ----- Pattern B: bare 'pool = "<role>"' lines -----
+    while IFS= read -r line; do
+        file="${line%%:*}"; rest="${line#*:}"
+        lineno="${rest%%:*}"; matched="${rest#*:}"
+
+        # The matched line IS the alias span — strip surrounding whitespace.
+        alias_span=$(printf '%s' "$matched" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+        # Suggested rewrite: insert 'gastown.' before the role inside quotes.
+        suggested=$(printf '%s' "$alias_span" | sed -E 's/"(refinery|polecat|witness|dog)"/"gastown.\1"/')
+
+        rel="${file#"$pack"/}"
+        emit_finding "$pack_name" "$rel" "$lineno" "$alias_span" "$suggested" "B"
+
+        found_total=$((found_total + 1))
+        pack_count=$((pack_count + 1))
+    done < <(grep -rn -E "${INCLUDES_B[@]}" "$PATTERN_B" "$pack" 2>/dev/null || true)
 
     PACK_NAMES+=("$pack_name")
     PACK_COUNTS+=("$pack_count")
