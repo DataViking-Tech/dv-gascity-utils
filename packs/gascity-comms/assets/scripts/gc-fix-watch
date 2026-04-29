@@ -133,21 +133,39 @@ discover_helpers() {
 # mtree_hash — content+timestamp fingerprint of a town's pack tree.
 # Uses stat -f for macOS portability; falls back to GNU stat on Linux.
 # Each line: <mtime> <size> <relative-path>. Sorted, then SHA-256.
+#
+# NEVER fails: the post-helpers re-hash race with helper file rewrites
+# (templater/helpers can create-and-rename mid-scan), which used to crash
+# the watcher under `set -euo pipefail` (mg-d80k3). Now wrapped so any
+# transient pipeline failure returns an empty hash; the caller treats
+# empty as "skip this cycle, don't update baseline" and we try again
+# next interval.
 mtree_hash() {
     local town="$1"
     local pack_root="$town/.gc/system/packs"
+    local out=""
 
+    # Disable set -e for the pipeline below so transient find/stat
+    # failures don't propagate. Restore exit-on-error semantics after.
+    set +e
     if [ "$(uname -s)" = "Darwin" ]; then
         # macOS stat (BSD): -f format string, %m=mtime epoch, %z=size, %N=name.
-        find "$pack_root" -type f -print0 2>/dev/null \
+        out=$(find "$pack_root" -type f -print0 2>/dev/null \
             | xargs -0 stat -f '%m %z %N' 2>/dev/null \
-            | sort
+            | sort \
+            | shasum -a 256 \
+            | awk '{print $1}')
     else
         # Linux stat (GNU): -c format string, %Y=mtime epoch, %s=size, %n=name.
-        find "$pack_root" -type f -print0 2>/dev/null \
+        out=$(find "$pack_root" -type f -print0 2>/dev/null \
             | xargs -0 stat -c '%Y %s %n' 2>/dev/null \
-            | sort
-    fi | shasum -a 256 | awk '{print $1}'
+            | sort \
+            | shasum -a 256 \
+            | awk '{print $1}')
+    fi
+    set -e
+
+    printf '%s' "$out"
 }
 
 # --- Helper dispatch ----------------------------------------------------
@@ -155,26 +173,40 @@ mtree_hash() {
 # run_helpers — invokes every discovered gc-fix-* helper against one town.
 # Each helper writes its own "fixed" / "already fixed" output. We capture
 # stdout+stderr line-by-line and prefix for readability.
+#
+# NEVER fails. Helper exit codes are explicitly logged but don't propagate
+# (mg-d80k3): pipefail+set-e used to combine with helper-pipeline exits
+# in surprising ways under bash 3.2. Disabling set -e for the dispatch
+# block makes the watcher resilient to anything a helper does.
 run_helpers() {
     local town="$1"
     local count=0
     local helper
+    local helper_status
 
+    set +e
     while IFS= read -r helper; do
         count=$((count + 1))
         if [ "$DRY_RUN" -eq 1 ]; then
             log "  would run: $(basename "$helper") $town"
         else
             log "  running: $(basename "$helper")"
-            # Run helper; indent its output. Don't fail the watcher if a
-            # helper errors — log and continue.
-            if ! "$helper" "$town" 2>&1 | sed 's|^|    |'; then
-                log "  warn: $(basename "$helper") exited non-zero (continuing)"
+            # Run helper; indent its output. Capture exit status separately
+            # so pipefail doesn't matter for the if-test below.
+            "$helper" "$town" 2>&1 | sed 's|^|    |'
+            helper_status=${PIPESTATUS[0]}
+            if [ "$helper_status" -ne 0 ]; then
+                log "  warn: $(basename "$helper") exited $helper_status (continuing)"
             fi
         fi
     done < <(discover_helpers)
+    set -e
 
-    [ "$count" -eq 0 ] && log "  warn: no gc-fix-* helpers found in ~/.gc/bin/ (nothing to run)"
+    if [ "$count" -eq 0 ]; then
+        log "  warn: no gc-fix-* helpers found in ~/.gc/bin/ (nothing to run)"
+    else
+        log "  helper cycle complete ($count helper(s) invoked)"
+    fi
 }
 
 # --- Main loop ----------------------------------------------------------
@@ -203,6 +235,13 @@ while true; do
     for i in "${!ROOTS[@]}"; do
         town="${ROOTS[$i]}"
         new="$(mtree_hash "$town")"
+        # Empty hash = transient file race during scan. Skip this cycle;
+        # try again next interval. Don't update baseline (we don't know
+        # if anything actually changed).
+        if [ -z "$new" ]; then
+            log "  skip: empty hash for $town (transient scan failure)"
+            continue
+        fi
         if [ "$new" != "${BASELINES[$i]}" ]; then
             log "change detected: $town (${BASELINES[$i]:0:12} -> ${new:0:12})"
             # Debounce: re-template can write files in bursts. Wait 2s
@@ -210,6 +249,10 @@ while true; do
             # — wait one more cycle.
             sleep 2
             settled="$(mtree_hash "$town")"
+            if [ -z "$settled" ]; then
+                log "  skip: empty hash on debounce (transient)"
+                continue
+            fi
             if [ "$settled" != "$new" ]; then
                 log "  still changing; deferring to next cycle"
                 BASELINES[$i]="$settled"
@@ -217,8 +260,15 @@ while true; do
             fi
             run_helpers "$town"
             # Update baseline AFTER helpers (they themselves may rewrite files).
-            BASELINES[$i]="$(mtree_hash "$town")"
-            log "  baseline updated: ${BASELINES[$i]:0:12}"
+            # Tolerate empty hash here too — keep prior baseline so next
+            # cycle can re-detect any further drift.
+            post="$(mtree_hash "$town")"
+            if [ -n "$post" ]; then
+                BASELINES[$i]="$post"
+                log "  baseline updated: ${BASELINES[$i]:0:12}"
+            else
+                log "  baseline kept (post-hash transient): ${BASELINES[$i]:0:12}"
+            fi
         fi
     done
 done
