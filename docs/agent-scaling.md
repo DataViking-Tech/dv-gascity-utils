@@ -115,6 +115,67 @@ min_active_sessions = 1
 If you only want certain rigs warm (e.g. demo rigs, but not background
 ones), include the override on those rigs only.
 
+## Cost of warm pools — when to leave it cold
+
+The `min_active_sessions = 1` warm-pool override has a real ongoing cost
+that the TL;DR above understates. The gastown polecat agent ships with
+`idle_timeout = "2h"`, which produces this loop on a rig with no work:
+
+1. Reconciler spawns a polecat to satisfy `min_active_sessions = 1`.
+2. Polecat checks its hook (`gc hook`), finds nothing, drains via
+   `gc runtime drain-ack`, and exits.
+3. Polecat sits as a logical session for up to `idle_timeout` (2h) until
+   the controller reaps it.
+4. Reconciler sees `count < 1` again, goto 1.
+
+Net: one spawn-drain-respawn cycle per rig per `idle_timeout` window,
+even when no work is queued. Each cycle is a small but real cost
+(session start, hook check, drain-ack, controller bookkeeping) and
+generates witness traffic ("polecat spawned, no work, draining" FYI
+mails).
+
+**Observed 2026-04-29:** `traitprint-cloud/gastown.furiosa` respawned
+4 times in ~3.5 hours with no work routed to the rig pool. Witness
+escalated as MED. Root cause was `min_active_sessions = 1` in
+`city.toml` for that rig (and synth-panel, dv-gascity-utils,
+traitprint — all four had been warmed at some point). Resolution:
+flip every polecat override to `min_active_sessions = 0` (the gastown
+default).
+
+### Heuristic — when to warm
+
+| Rig profile                            | Warm? | Why                                                   |
+|----------------------------------------|-------|-------------------------------------------------------|
+| Steady backlog, work routed every <2h  | Yes   | Warm session is reused, idle window doesn't kick in   |
+| Bursty (demo, on-call), latency matters| Yes   | First-bead latency is the dominant cost               |
+| Mostly idle, work arrives ad-hoc       | No    | Cold-spawn latency is one-time; warm churn is forever |
+| Suspended / parked rigs                | No    | Don't burn cycles on rigs you're not actively working |
+
+When in doubt, **leave it cold (`min_active_sessions = 0`)**. The
+gastown default is cold for a reason — bumping it should be a
+deliberate response to observed latency pain on a *specific* rig,
+not a default applied everywhere.
+
+### Reverting a warm override
+
+Either delete the `[[rigs.overrides]]` block entirely, or flip the
+value:
+
+```toml
+[[rigs.overrides]]
+agent = "polecat"
+min_active_sessions = 0
+```
+
+Then `gc reload`. Existing warm sessions drain on their next idle
+timeout; no new ones spawn.
+
+Leave the refinery override at `min_active_sessions = 1`. The
+refinery is the merge-queue worker — losing the warm slot just
+delays merges, and the refinery's idle behavior is different (it
+processes merges back-to-back when work appears, not the same
+spawn-drain churn the polecat sees).
+
 ## Other fields that work in `[[rigs.overrides]]`
 
 The override block accepts any field defined on the agent's
