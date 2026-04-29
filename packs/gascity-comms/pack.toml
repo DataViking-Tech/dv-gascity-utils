@@ -32,6 +32,14 @@
 #     merge/close, and records ci_status on green. Never auto-merges.
 #     See dv-gascity-utils/docs/diagnostic-runbook.md for the "PR autonomy"
 #     section.
+#   - gc-tune-refinery-loop, the refinery find-work latency tuner:
+#       - Caps the refinery's idle-watch doubling at 60s (was 300s) so a
+#         freshly-pushed polecat branch is consumed within a minute even
+#         after long quiet periods.
+#       - Adds a `gc session nudge` to the polecat done-sequence so polecats
+#         actively wake the refinery instead of relying purely on the
+#         events watch firing.
+#       See dv-gascity-utils/docs/refinery-latency-tuning.md for the design.
 #
 # Per-host setup (after import is materialized):
 #   1. Symlink the wrappers:
@@ -39,11 +47,14 @@
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-rig-join ~/.gc/bin/gc-rig-join
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-refinery-routing ~/.gc/bin/gc-fix-refinery-routing
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-merge-strategy ~/.gc/bin/gc-fix-merge-strategy
+#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-tune-refinery-loop ~/.gc/bin/gc-tune-refinery-loop
 #   2. Initialize the per-host peer registry:
 #        cp {{ConfigDir}}/system/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
 #      then fill in url + token_file for each peer the host should reach.
 #   3. Run `gc-fix-merge-strategy` once to install the auto-detect logic
 #      into this host's gastown system pack.
+#   4. Run `gc-tune-refinery-loop` once to bound refinery find-work latency
+#      to ~60s on this host's gastown system pack.
 #
 # Tokens stay outside the pack (one per host, mode 0600 in ~/.gc/tokens/).
 # peers.toml lives outside the pack (per-host registry, never shared).

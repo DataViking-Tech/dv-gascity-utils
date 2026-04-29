@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# gc-tune-refinery-loop — bound refinery find-work latency to ~60s.
+#
+# Without this fix, the refinery's find-work loop runs:
+#   SEQ=$(gc events --seq)
+#   gc events --watch --type=bead.updated --after=$SEQ --timeout 30s
+# and on timeout the formula instructs the agent to "wait again with
+# doubled timeout (cap 300s)". After ~7 min idle, the timeout grows to
+# 300s and a freshly-pushed polecat branch can sit unconsumed for the
+# bulk of that window before the watch returns. Observed steady-state
+# latency: ~5 min per merge. (Tracking bead: dgu-arvqg.)
+#
+# Two complementary patches close the gap:
+#
+#   1. mol-refinery-patrol.toml — replace "cap 300s" with "cap 60s" so
+#      the worst-case watch wait is bounded at one minute regardless of
+#      how long the refinery has been idle.
+#
+#   2. mol-polecat-work.toml + agents/polecat/prompt.template.md +
+#      template-fragments/approval-fallacy.template.md — add a
+#      `gc session nudge $GC_RIG/gastown.refinery` to the done-sequence
+#      so polecats actively wake the refinery rather than relying on
+#      the events watch to fire. Best-effort: nudge failures are
+#      ignored (refinery may be off-host or sleeping; the bead
+#      assignment + gc.routed_to still fires the reconciler path).
+#
+# Files touched per pack (skipped silently if absent):
+#   formulas/mol-refinery-patrol.toml
+#   formulas/mol-polecat-work.toml
+#   agents/polecat/prompt.template.md
+#   template-fragments/approval-fallacy.template.md
+#
+# Idempotent: each rewrite is guarded by a marker grep. Fixed packs
+# report "already fixed".
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-tune-refinery-loop — bound refinery find-work latency to ~60s.
+
+Usage:
+  gc-tune-refinery-loop [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/gastown that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Patches:
+  • mol-refinery-patrol.toml — cap doubling timeout at 60s (was 300s)
+  • polecat done-sequence — add `gc session nudge` wake call
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-tune-refinery-loop                       # scan ~/* and patch every gastown pack
+  gc-tune-refinery-loop --dry-run             # preview without writing
+  gc-tune-refinery-loop ~/yggdrasil ~/asgard  # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-tune-refinery-loop: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs/gastown" ] && ROOTS+=("$d")
+    done
+fi
+
+[ ${#ROOTS[@]} -gt 0 ] || die "no gastown system packs found under $HOME/*; pass explicit roots"
+
+# patch_with_python <file> <python-script>
+# - python-script reads file content from stdin and writes patched content to stdout.
+# - The python script is responsible for idempotency: if no patch is needed, it must
+#   write the input unchanged so the diff check below sees no change.
+patch_with_python() {
+    local file="$1" script="$2"
+    if [ ! -f "$file" ]; then
+        echo "    skip (missing): ${file#$HOME/}"
+        return
+    fi
+    local tmp; tmp=$(mktemp)
+    if ! python3 -c "$script" <"$file" >"$tmp"; then
+        rm -f "$tmp"
+        die "python patch failed on $file"
+    fi
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        echo "    ok (already fixed): ${file#$HOME/}"
+        return
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        rm -f "$tmp"
+        echo "    would edit: ${file#$HOME/}"
+        return
+    fi
+    mv "$tmp" "$file"
+    echo "    fixed: ${file#$HOME/}"
+}
+
+# Patch 1: mol-refinery-patrol.toml — cap doubling at 60s instead of 300s.
+read -r -d '' REFINERY_PATCH <<'PYEOF' || true
+import sys
+
+src = sys.stdin.read()
+old = 'wait again with doubled timeout (cap 300s)'
+new = 'wait again with doubled timeout (cap 60s; polecats wake the refinery via `gc session nudge` at done-sequence, so a long backoff just adds latency)'
+
+if old not in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+sys.stdout.write(src.replace(old, new, 1))
+PYEOF
+
+# Patch 2: mol-polecat-work.toml — add wake nudge after refinery reassignment.
+# Insert between step 5 (Reassign to refinery) and step 6 (Signal reconciler and exit).
+read -r -d '' FORMULA_PATCH <<'PYEOF' || true
+import sys
+
+src = sys.stdin.read()
+marker = 'gc session nudge'
+if marker in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+old = (
+    'spawns phantom polecats that can\'t claim the bead.\n'
+    '\n'
+    'The refinery will pick this up, rebase onto {{base_branch}}, run tests,\n'
+)
+new = (
+    'spawns phantom polecats that can\'t claim the bead.\n'
+    '\n'
+    '**6. Wake the refinery (best-effort, non-blocking):**\n'
+    '```bash\n'
+    'gc session nudge "$GC_RIG/gastown.refinery" "new work: {{issue}}" 2>/dev/null || true\n'
+    '```\n'
+    'This sends a text input to the refinery session so it wakes from any\n'
+    'idle `gc events --watch` cycle on the next iteration. Failure is\n'
+    'ignored — the bead assignment + `gc.routed_to` still drives the\n'
+    'reconciler\'s on-demand spawn path.\n'
+    '\n'
+    'The refinery will pick this up, rebase onto {{base_branch}}, run tests,\n'
+)
+
+if old not in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+src = src.replace(old, new, 1)
+
+# Renumber the now-7th step header from "**6. Signal..." to "**7. Signal..."
+src = src.replace('**6. Signal reconciler and exit.**', '**7. Signal reconciler and exit.**', 1)
+
+sys.stdout.write(src)
+PYEOF
+
+# Patch 3: agents/polecat/prompt.template.md — append wake nudge to the
+# done-sequence example block. Marker prevents re-application.
+# Handles both the pre-fix `<rig>/refinery` alias and the post-fix
+# `<rig>/gastown.refinery` alias (gc-fix-refinery-routing may have
+# already canonicalized this pack).
+read -r -d '' PROMPT_PATCH <<'PYEOF' || true
+import sys, re
+
+src = sys.stdin.read()
+marker = 'gc session nudge'
+if marker in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+# Match the canonical line "gc bd update <work-bead> --status=open --assignee=...refinery..."
+# whose next non-blank line is "gc runtime drain-ack". Insert the nudge call between them.
+pattern = re.compile(
+    r'(gc bd update <work-bead> --status=open --assignee=[^\n]+refinery[^\n]*\n)'
+    r'(gc runtime drain-ack\n)'
+)
+replacement = (
+    r'\1'
+    'gc session nudge "$GC_RIG/gastown.refinery" "new work: <work-bead>" 2>/dev/null || true\n'
+    r'\2'
+)
+
+new_src, n = pattern.subn(replacement, src)
+if n == 0:
+    sys.stdout.write(src)
+    sys.exit(0)
+sys.stdout.write(new_src)
+PYEOF
+
+# Patch 4: template-fragments/approval-fallacy.template.md — same wake
+# nudge insertion as the polecat prompt template.
+read -r -d '' FRAGMENT_PATCH <<'PYEOF' || true
+import sys, re
+
+src = sys.stdin.read()
+marker = 'gc session nudge'
+if marker in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+pattern = re.compile(
+    r'(gc bd update <work-bead> --status=open --assignee=[^\n]+refinery[^\n]*\n)'
+    r'(gc runtime drain-ack\n)'
+)
+replacement = (
+    r'\1'
+    'gc session nudge "$GC_RIG/gastown.refinery" "new work: <work-bead>" 2>/dev/null || true\n'
+    r'\2'
+)
+
+new_src, n = pattern.subn(replacement, src)
+if n == 0:
+    sys.stdout.write(src)
+    sys.exit(0)
+sys.stdout.write(new_src)
+PYEOF
+
+fix_pack() {
+    local pack="$1"
+    echo "  ${pack#$HOME/}:"
+
+    patch_with_python "$pack/formulas/mol-refinery-patrol.toml" "$REFINERY_PATCH"
+    patch_with_python "$pack/formulas/mol-polecat-work.toml" "$FORMULA_PATCH"
+    patch_with_python "$pack/agents/polecat/prompt.template.md" "$PROMPT_PATCH"
+    patch_with_python "$pack/template-fragments/approval-fallacy.template.md" "$FRAGMENT_PATCH"
+}
+
+echo "Scanning ${#ROOTS[@]} root(s):"
+for r in "${ROOTS[@]}"; do echo "  $r"; done
+echo
+
+for r in "${ROOTS[@]}"; do
+    pack="$r/.gc/system/packs/gastown"
+    if [ ! -d "$pack" ]; then
+        echo "[$r] no gastown pack — skipping"
+        continue
+    fi
+    fix_pack "$pack"
+done
+
+echo
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "dry-run complete; no files were changed"
+else
+    echo "done. Re-run safely; subsequent runs report 'already fixed'."
+fi
