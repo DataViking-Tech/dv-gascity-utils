@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# gc-fix-watch — re-apply gc-fix-* helpers after the gc binary re-templates packs.
+#
+# Why this exists:
+#
+# The gc binary embeds pack contents (formulas, orders, prompt templates,
+# etc.) at compile time and re-renders them to disk under
+# `<town>/.gc/system/packs/` on supervisor startup, on some `gc supervisor
+# reload` paths, and during heavy reconciler events. Any in-place patches
+# applied by gc-fix-* helpers are wiped by the next render burst, even
+# though the helpers themselves are idempotent and safe to re-run.
+#
+# Per-host workaround until the binary supports config-level overrides
+# (e.g. `[[orders.overrides]] pool = "<fqn>"` actually being honored, or
+# a `[[agent]] override` table that survives re-template):
+# watch the pack tree, and re-run every gc-fix-* helper symlinked into
+# `~/.gc/bin/` whenever the tree changes. Helpers are idempotent (each
+# uses a marker check), so re-firing on every render burst is safe.
+#
+# Pack-agnostic: invokes every executable named `gc-fix-*` in `~/.gc/bin/`
+# (resolving symlinks). New helpers register by symlinking — no edits
+# here required.
+#
+# Activation: foreground daemon by default. Background via launchd plist
+# on macOS or systemd unit on Linux (templates under packs/gascity-comms/
+# assets/launchd/ and assets/systemd/).
+#
+# Tracking: gc-binary re-template wipe (mg-ovjgn discussion, dgu-side TBD).
+
+set -euo pipefail
+
+# --- Defaults -----------------------------------------------------------
+
+INTERVAL=30        # poll seconds; debounced 2s after change detected
+DRY_RUN=0
+ONCE=0
+QUIET=0
+ROOTS=()
+
+# --- Helpers ------------------------------------------------------------
+
+die() { echo "gc-fix-watch: $*" >&2; exit 1; }
+
+log() {
+    [ "$QUIET" -eq 1 ] && return 0
+    echo "[$(date -u +%FT%TZ)] $*"
+}
+
+usage() {
+    cat <<'EOF'
+gc-fix-watch — re-apply gc-fix-* helpers when the pack tree changes.
+
+Usage:
+  gc-fix-watch [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/ that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --interval N    Poll interval in seconds (default 30).
+  --once          Run a single check and exit (for testing).
+  --dry-run       Detect change; print helpers that would run; don't run them.
+  --quiet         Suppress periodic status output.
+  -h, --help      Show this help.
+
+Examples:
+  gc-fix-watch                            # foreground daemon, default cadence
+  gc-fix-watch --once --dry-run           # one-shot preview
+  gc-fix-watch --interval 10 ~/midgard    # tight polling on a specific town
+EOF
+}
+
+# --- Argument parsing ---------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --once) ONCE=1; shift ;;
+        --quiet) QUIET=1; shift ;;
+        --interval)
+            shift
+            [ $# -gt 0 ] || die "--interval requires a value"
+            INTERVAL="$1"
+            shift
+            ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+# --- Discovery ----------------------------------------------------------
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs" ] && ROOTS+=("$d")
+    done
+fi
+
+[ ${#ROOTS[@]} -gt 0 ] || die "no towns found under $HOME/* with .gc/system/packs/; pass explicit roots"
+
+# Validate roots up front so a typo doesn't fail silently mid-loop.
+for r in "${ROOTS[@]}"; do
+    [ -d "$r/.gc/system/packs" ] || die "not a town root (no .gc/system/packs/): $r"
+done
+
+# --- Helper discovery ---------------------------------------------------
+
+# discover_helpers — lists executable gc-fix-* helpers in ~/.gc/bin/, one
+# per line, EXCLUDING gc-fix-watch itself (no infinite recursion when
+# watcher gets symlinked alongside the helpers).
+discover_helpers() {
+    local self
+    self="$(basename "${BASH_SOURCE[0]}")"
+    local bin_dir="$HOME/.gc/bin"
+    [ -d "$bin_dir" ] || return 0
+
+    # Use a glob that survives no-match (nullglob). Restore default after.
+    shopt -s nullglob
+    for f in "$bin_dir"/gc-fix-*; do
+        local name
+        name="$(basename "$f")"
+        [ "$name" = "$self" ] && continue
+        [ -x "$f" ] || continue
+        echo "$f"
+    done
+    shopt -u nullglob
+}
+
+# --- Mtree hashing ------------------------------------------------------
+
+# mtree_hash — content+timestamp fingerprint of a town's pack tree.
+# Uses stat -f for macOS portability; falls back to GNU stat on Linux.
+# Each line: <mtime> <size> <relative-path>. Sorted, then SHA-256.
+mtree_hash() {
+    local town="$1"
+    local pack_root="$town/.gc/system/packs"
+
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # macOS stat (BSD): -f format string, %m=mtime epoch, %z=size, %N=name.
+        find "$pack_root" -type f -print0 2>/dev/null \
+            | xargs -0 stat -f '%m %z %N' 2>/dev/null \
+            | sort
+    else
+        # Linux stat (GNU): -c format string, %Y=mtime epoch, %s=size, %n=name.
+        find "$pack_root" -type f -print0 2>/dev/null \
+            | xargs -0 stat -c '%Y %s %n' 2>/dev/null \
+            | sort
+    fi | shasum -a 256 | awk '{print $1}'
+}
+
+# --- Helper dispatch ----------------------------------------------------
+
+# run_helpers — invokes every discovered gc-fix-* helper against one town.
+# Each helper writes its own "fixed" / "already fixed" output. We capture
+# stdout+stderr line-by-line and prefix for readability.
+run_helpers() {
+    local town="$1"
+    local count=0
+    local helper
+
+    while IFS= read -r helper; do
+        count=$((count + 1))
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "  would run: $(basename "$helper") $town"
+        else
+            log "  running: $(basename "$helper")"
+            # Run helper; indent its output. Don't fail the watcher if a
+            # helper errors — log and continue.
+            if ! "$helper" "$town" 2>&1 | sed 's|^|    |'; then
+                log "  warn: $(basename "$helper") exited non-zero (continuing)"
+            fi
+        fi
+    done < <(discover_helpers)
+
+    [ "$count" -eq 0 ] && log "  warn: no gc-fix-* helpers found in ~/.gc/bin/ (nothing to run)"
+}
+
+# --- Main loop ----------------------------------------------------------
+
+# Parallel arrays for baselines (bash 3.2 on macOS lacks `declare -A`).
+# BASELINES[i] is the most recent mtree hash for ROOTS[i].
+BASELINES=()
+
+log "starting (towns: ${ROOTS[*]}, interval: ${INTERVAL}s, dry-run: ${DRY_RUN}, once: ${ONCE})"
+
+# Initial baseline. Don't run helpers on startup — we trust prior state.
+# (Operators should run helpers manually once before activating watcher;
+# subsequent re-templates will be caught.)
+for i in "${!ROOTS[@]}"; do
+    BASELINES[$i]="$(mtree_hash "${ROOTS[$i]}")"
+    log "baseline: ${ROOTS[$i]} -> ${BASELINES[$i]:0:12}"
+done
+
+if [ "$ONCE" -eq 1 ]; then
+    log "--once: skipping watch loop"
+    exit 0
+fi
+
+while true; do
+    sleep "$INTERVAL"
+    for i in "${!ROOTS[@]}"; do
+        town="${ROOTS[$i]}"
+        new="$(mtree_hash "$town")"
+        if [ "$new" != "${BASELINES[$i]}" ]; then
+            log "change detected: $town (${BASELINES[$i]:0:12} -> ${new:0:12})"
+            # Debounce: re-template can write files in bursts. Wait 2s
+            # and re-hash; if still changing, the write is in progress
+            # — wait one more cycle.
+            sleep 2
+            settled="$(mtree_hash "$town")"
+            if [ "$settled" != "$new" ]; then
+                log "  still changing; deferring to next cycle"
+                BASELINES[$i]="$settled"
+                continue
+            fi
+            run_helpers "$town"
+            # Update baseline AFTER helpers (they themselves may rewrite files).
+            BASELINES[$i]="$(mtree_hash "$town")"
+            log "  baseline updated: ${BASELINES[$i]:0:12}"
+        fi
+    done
+done

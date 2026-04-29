@@ -1,0 +1,37 @@
+# systemd user unit template for gc-fix-watch (Linux).
+#
+# Install (per-user, runs while logged in):
+#   1. Copy to ~/.config/systemd/user/gc-fix-watch.service
+#   2. systemctl --user daemon-reload
+#   3. systemctl --user enable --now gc-fix-watch.service
+#   4. journalctl --user -u gc-fix-watch -f
+#
+# Uninstall:
+#   systemctl --user disable --now gc-fix-watch.service
+#   rm ~/.config/systemd/user/gc-fix-watch.service
+#   systemctl --user daemon-reload
+#
+# Lingering (run even when user not logged in):
+#   sudo loginctl enable-linger $USER
+#
+# Per-user matches macOS LaunchAgent semantics: the gc supervisor runs as
+# the user, so the watcher should too. If your supervisor is a system
+# service, install this as a system unit (/etc/systemd/system/) instead
+# and adjust User=/Group=.
+
+[Unit]
+Description=gc-fix-watch — re-apply gc-fix-* helpers when pack tree changes
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.gc/bin/gc-fix-watch --interval 30
+Restart=on-failure
+RestartSec=10s
+
+# Don't tie watcher lifetime to a TTY; allow detached operation.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
