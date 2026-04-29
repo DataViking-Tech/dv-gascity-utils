@@ -16,6 +16,7 @@ DataViking-Tech utilities and patterns for [Gas City](https://docs.gascityhall.c
 - **`docs/alias-canonicalization.md`** — why `<rig>/gastown.<role>` is the canonical agent alias form, how short-form leaks cause silent routing failures, and the `gc-audit-alias-mismatch` / `gc-fix-alias-mismatch` workflow.
 - **`docs/rig-merge-strategy.md`** — how the polecat picks `direct` vs `mr` merge mode at submit time, the resolution order (existing metadata > per-rig override file > auto-detect via GitHub branches API > fallback `direct`), and how to install the `gc-fix-merge-strategy` patch helper.
 - **`docs/collaborative-loops.md`** — protocol for collaborative `/loop`s between mayors on different cities: the structural autonomy gap that motivates it, the active-thread heuristic, the in-band suggestion shape, the `ScheduleWakeup` cadence table, and three opt-in mechanisms (cleanest first). Pairs with the `collaborative-loop-suggest` template fragment.
+- **`docs/agent-scaling.md`** — schema-valid recipe for overriding scaling fields (`min_active_sessions`, `max_active_sessions`, `idle_timeout`, …) on rig-scoped agents (witness/refinery/polecat) via `[[rigs.overrides]]` in `city.toml`. The right knob for keeping one polecat warm per rig.
 
 ## Status
 
