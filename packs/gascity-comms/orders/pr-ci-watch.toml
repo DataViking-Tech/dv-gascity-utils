@@ -1,0 +1,33 @@
+# pr-ci-watch — close the PR-protected merge loop.
+#
+# When the refinery's mr-mode opens a PR (or a polecat's direct-merge hits
+# branch protection and a human opens the PR manually), GitHub CI runs but
+# nothing autonomous reacts to it. This order polls open PRs linked to
+# tracked beads and:
+#
+#   - On CI fail: reslings — reopens the bead, sets rejection metadata,
+#     routes back to the rig's polecat pool with metadata.existing_pr so
+#     the refinery reuses the same PR after the polecat resubmits.
+#   - On PR merged externally: marks merge_result=merged_external and
+#     records the merged sha; tracking stops.
+#   - On PR closed without merge: marks merge_result=closed_without_merge;
+#     tracking stops.
+#   - On CI pass: records ci_status=passed and leaves the PR alone — we
+#     do NOT auto-merge. Branch protection is intentional for human-facing
+#     repos; humans (or downstream tooling) merge.
+#
+# Idempotent: each cycle reads bead state fresh; terminal merge_result
+# values are skipped. Capped at 3 consecutive CI-failure reslings before
+# escalating to mayor (override via PR_CI_WATCH_MAX_RESLINGS).
+#
+# Requires per-host gh CLI auth on the host running this order. Tokens
+# live in ~/.config/gh/, never in this pack.
+#
+# Detailed flow + recovery recipes: ../../docs/diagnostic-runbook.md (PR
+# autonomy section).
+
+[order]
+description = "Watch PRs linked to tracked beads; resling on CI failure"
+trigger = "cooldown"
+interval = "5m"
+exec = "$PACK_DIR/assets/scripts/pr-ci-watch.sh"

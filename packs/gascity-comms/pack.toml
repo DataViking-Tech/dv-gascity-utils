@@ -25,6 +25,13 @@
 #         `gc sling --merge mr`) and a per-rig override file
 #         `<rig-root>/.gc-merge-strategy`.
 #       See dv-gascity-utils/docs/rig-merge-strategy.md for the design.
+#   - pr-ci-watch order: closes the PR-protected merge loop. Every 5 min it
+#     polls open PRs linked to tracked beads (refinery mr-mode handoffs and
+#     blocked-direct-merge beads with a manually opened PR) and reslings to
+#     the rig's polecat pool on CI failure, marks merge_result on external
+#     merge/close, and records ci_status on green. Never auto-merges.
+#     See dv-gascity-utils/docs/diagnostic-runbook.md for the "PR autonomy"
+#     section.
 #
 # Per-host setup (after import is materialized):
 #   1. Symlink the wrappers:
