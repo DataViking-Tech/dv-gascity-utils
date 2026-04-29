@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# gc-fix-merge-strategy — make polecat done-sequence auto-detect PR-protected branches.
+#
+# Without this fix, polecats hand work beads to the refinery without setting
+# `metadata.merge_strategy`. The refinery defaults to `direct` and tries
+# `git push origin <target>`, which is rejected by branch protection (GH013)
+# on rigs like DataViking-Tech/traitprint-cloud and DataViking-Tech/traitprint.
+# The mayor then has to open a PR manually. (Tracking bead: dgu-26ptn.)
+#
+# This helper patches the polecat done-sequence in every gastown system pack
+# found on this host. Each town's `.gc/system/packs/gastown/` is a runtime
+# copy that is not in any git repo, so the only authoritative way to apply
+# the fix locally is in-place (same pattern as gc-fix-refinery-routing).
+#
+# After the patch, the polecat's submit-and-exit step:
+#   1. Honors `metadata.merge_strategy` if already set (e.g. `gc sling --merge mr`).
+#   2. Reads `<rig-root>/.gc-merge-strategy` if present (single line: `mr` or `direct`).
+#   3. Auto-detects via `gh api repos/<owner>/<repo>/branches/<target>` and
+#      checks the `protected` boolean (visible to non-admin tokens; the
+#      `/protection` sub-endpoint is admin-only and returns 404 otherwise).
+#   4. Falls back to `direct` if all checks fail.
+#
+# Files touched per pack (skipped silently if absent):
+#   formulas/mol-polecat-work.toml
+#   agents/polecat/prompt.template.md
+#   template-fragments/approval-fallacy.template.md
+#
+# Idempotent: each rewrite is guarded by a marker check (looks for
+# `merge_strategy=` in the done sequence). Fixed packs report "already fixed".
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-merge-strategy — auto-detect PR-protected branches in polecat done-sequence.
+
+Usage:
+  gc-fix-merge-strategy [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/gastown that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-fix-merge-strategy                       # scan ~/* and patch every gastown pack
+  gc-fix-merge-strategy --dry-run             # preview without writing
+  gc-fix-merge-strategy ~/yggdrasil ~/asgard  # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-fix-merge-strategy: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs/gastown" ] && ROOTS+=("$d")
+    done
+fi
+
+[ ${#ROOTS[@]} -gt 0 ] || die "no gastown system packs found under $HOME/*; pass explicit roots"
+
+# patch_with_python <file> <python-script>
+# - python-script reads file content from stdin and writes patched content to stdout.
+# - The python script is responsible for idempotency: if no patch is needed, it must
+#   write the input unchanged so the diff check below sees no change.
+patch_with_python() {
+    local file="$1" script="$2"
+    if [ ! -f "$file" ]; then
+        echo "    skip (missing): ${file#$HOME/}"
+        return
+    fi
+    local tmp; tmp=$(mktemp)
+    if ! python3 -c "$script" <"$file" >"$tmp"; then
+        rm -f "$tmp"
+        die "python patch failed on $file"
+    fi
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        echo "    ok (already fixed): ${file#$HOME/}"
+        return
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        rm -f "$tmp"
+        echo "    would edit: ${file#$HOME/}"
+        return
+    fi
+    mv "$tmp" "$file"
+    echo "    fixed: ${file#$HOME/}"
+}
+
+# Patch script for formulas/mol-polecat-work.toml.
+# Replaces step 4 of submit-and-exit ("Update metadata on the work bead")
+# with an expanded variant that resolves merge_strategy.
+read -r -d '' FORMULA_PATCH <<'PYEOF' || true
+import sys, re
+
+src = sys.stdin.read()
+
+# Marker: the patched version contains MERGE_STRATEGY= in this step.
+# If present anywhere in the file, treat as already patched.
+if re.search(r'MERGE_STRATEGY=', src):
+    sys.stdout.write(src)
+    sys.exit(0)
+
+# Match the literal block we want to replace. The exact text in the
+# unpatched gastown pack:
+#
+# **4. Update metadata on the work bead:**
+# ```bash
+# gc bd update {{issue}} \
+#   --set-metadata target={{base_branch}} \
+#   --notes "Implemented: <brief summary>"
+# ```
+# Branch was recorded in workspace-setup and is already in metadata.
+old = (
+    '**4. Update metadata on the work bead:**\n'
+    '```bash\n'
+    'gc bd update {{issue}} \\\n'
+    '  --set-metadata target={{base_branch}} \\\n'
+    '  --notes "Implemented: <brief summary>"\n'
+    '```\n'
+)
+new = (
+    '**4. Detect merge strategy and update metadata on the work bead:**\n'
+    '\n'
+    'Determine whether the target branch is PR-protected. If so, set\n'
+    '`metadata.merge_strategy=mr` so the refinery publishes a pull request\n'
+    'instead of attempting a direct merge (which would be rejected by\n'
+    'branch protection — GitHub error GH013).\n'
+    '\n'
+    'Resolution order:\n'
+    '1. Existing `metadata.merge_strategy` (e.g. set by `gc sling --merge`).\n'
+    '2. Per-rig override file `<rig-root>/.gc-merge-strategy` (`mr` or `direct`).\n'
+    '3. Auto-detect via `gh api repos/<owner>/<repo>/branches/<target>` and\n'
+    '   read the `protected` boolean (works for non-admin tokens; the\n'
+    '   `/protection` sub-endpoint is admin-only and returns 404 otherwise).\n'
+    '4. Fallback `direct`.\n'
+    '\n'
+    '```bash\n'
+    'TARGET={{base_branch}}\n'
+    'MERGE_STRATEGY=$(gc bd show {{issue}} --json | jq -r \'.[0].metadata.merge_strategy // empty\')\n'
+    'if [ -z "$MERGE_STRATEGY" ] && [ -f .gc-merge-strategy ]; then\n'
+    '    MERGE_STRATEGY=$(head -1 .gc-merge-strategy | tr -d \'[:space:]\')\n'
+    'fi\n'
+    'if [ -z "$MERGE_STRATEGY" ]; then\n'
+    '    ORIGIN_REPO=$(gh repo view --json nameWithOwner -q \'.nameWithOwner\' 2>/dev/null || true)\n'
+    '    PROTECTED=$([ -n "$ORIGIN_REPO" ] && gh api "repos/$ORIGIN_REPO/branches/$TARGET" --jq \'.protected\' 2>/dev/null || true)\n'
+    '    if [ "$PROTECTED" = "true" ]; then\n'
+    '        MERGE_STRATEGY=mr\n'
+    '    else\n'
+    '        MERGE_STRATEGY=direct\n'
+    '    fi\n'
+    'fi\n'
+    'gc bd update {{issue}} \\\n'
+    '  --set-metadata target=$TARGET \\\n'
+    '  --set-metadata merge_strategy=$MERGE_STRATEGY \\\n'
+    '  --notes "Implemented: <brief summary> (merge_strategy=$MERGE_STRATEGY)"\n'
+    '```\n'
+)
+
+if old not in src:
+    # Not the expected unpatched shape. Bail without touching the file so
+    # the user sees "already fixed" / no diff and can investigate.
+    sys.stdout.write(src)
+    sys.exit(0)
+
+sys.stdout.write(src.replace(old, new, 1))
+PYEOF
+
+# Patch script for the polecat prompt template (final reminder block).
+# Adds a sentence after the done-sequence block referring to the formula
+# step for the merge_strategy details. Keeps the example block compact.
+read -r -d '' PROMPT_PATCH <<'PYEOF' || true
+import sys
+
+src = sys.stdin.read()
+
+if '`merge_strategy` is auto-detected' in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+# Insert a one-line note after the "Idle Polecat heresy." paragraph,
+# which is the wrap-up of the FINAL REMINDER section.
+marker = (
+    'pool check command finds more work. Sitting idle after finishing implementation\n'
+    'is the "Idle Polecat heresy."\n'
+)
+addition = marker + (
+    '\n'
+    '`merge_strategy` is auto-detected by the formula step (PR-protected\n'
+    'targets get `mr`; everything else gets `direct`). Override per-rig\n'
+    'via `<rig-root>/.gc-merge-strategy` or per-bead via `gc sling --merge`.\n'
+)
+
+if marker not in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+sys.stdout.write(src.replace(marker, addition, 1))
+PYEOF
+
+# Patch script for the approval-fallacy fragment. Same one-line addition
+# pattern as the prompt template.
+read -r -d '' FRAGMENT_PATCH <<'PYEOF' || true
+import sys
+
+src = sys.stdin.read()
+
+if '`merge_strategy` is auto-detected' in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+marker = (
+    'This pushes your branch, sets metadata so the Refinery knows what to merge,\n'
+    'reassigns the work bead to the Refinery, and signals the reconciler to kill\n'
+    'this session. `gc runtime drain-ack` ensures the reconciler stops you\n'
+    'immediately — even if `exit` doesn\'t fire. No separate MR beads.\n'
+)
+addition = marker + (
+    '\n'
+    '`merge_strategy` is auto-detected by the formula step (PR-protected\n'
+    'targets get `mr`; everything else gets `direct`). Override per-rig\n'
+    'via `<rig-root>/.gc-merge-strategy` or per-bead via `gc sling --merge`.\n'
+)
+
+if marker not in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+sys.stdout.write(src.replace(marker, addition, 1))
+PYEOF
+
+fix_pack() {
+    local pack="$1"
+    echo "  ${pack#$HOME/}:"
+
+    patch_with_python "$pack/formulas/mol-polecat-work.toml" "$FORMULA_PATCH"
+    patch_with_python "$pack/agents/polecat/prompt.template.md" "$PROMPT_PATCH"
+    patch_with_python "$pack/template-fragments/approval-fallacy.template.md" "$FRAGMENT_PATCH"
+}
+
+echo "Scanning ${#ROOTS[@]} root(s):"
+for r in "${ROOTS[@]}"; do echo "  $r"; done
+echo
+
+for r in "${ROOTS[@]}"; do
+    pack="$r/.gc/system/packs/gastown"
+    if [ ! -d "$pack" ]; then
+        echo "[$r] no gastown pack — skipping"
+        continue
+    fi
+    fix_pack "$pack"
+done
+
+echo
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "dry-run complete; no files were changed"
+else
+    echo "done. Re-run safely; subsequent runs report 'already fixed'."
+fi

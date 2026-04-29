@@ -12,14 +12,31 @@
 #       - Runs `gc rig add --adopt --prefix <p>` so the second city joins instead
 #         of forking a duplicate prefix database
 #       See dv-gascity-utils/docs/shared-rig-prefix.md for the design.
+#   - gc-fix-refinery-routing, the polecat done-sequence assignee fix:
+#       - Patches the gastown system pack so polecats reassign work beads to
+#         '<rig>/gastown.refinery' (the namedWorkReady-resolvable form),
+#         not the short '<rig>/refinery' that leaves the on-demand refinery
+#         slot dormant.
+#   - gc-fix-merge-strategy, the polecat PR-protected branch fix:
+#       - Patches the polecat submit-and-exit step to auto-detect branch
+#         protection via `gh api repos/<r>/branches/<t>` and set
+#         metadata.merge_strategy=mr when the target is protected.
+#       - Honors metadata.merge_strategy if already set (e.g. via
+#         `gc sling --merge mr`) and a per-rig override file
+#         `<rig-root>/.gc-merge-strategy`.
+#       See dv-gascity-utils/docs/rig-merge-strategy.md for the design.
 #
 # Per-host setup (after import is materialized):
 #   1. Symlink the wrappers:
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gcx ~/.gc/bin/gcx
 #        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-rig-join ~/.gc/bin/gc-rig-join
+#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-refinery-routing ~/.gc/bin/gc-fix-refinery-routing
+#        ln -sf {{ConfigDir}}/system/packs/gascity-comms/assets/scripts/gc-fix-merge-strategy ~/.gc/bin/gc-fix-merge-strategy
 #   2. Initialize the per-host peer registry:
 #        cp {{ConfigDir}}/system/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
 #      then fill in url + token_file for each peer the host should reach.
+#   3. Run `gc-fix-merge-strategy` once to install the auto-detect logic
+#      into this host's gastown system pack.
 #
 # Tokens stay outside the pack (one per host, mode 0600 in ~/.gc/tokens/).
 # peers.toml lives outside the pack (per-host registry, never shared).
