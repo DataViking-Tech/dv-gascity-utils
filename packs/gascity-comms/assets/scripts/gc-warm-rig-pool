@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# gc-warm-rig-pool — keep one polecat (and one refinery) warm in every
+# rig by adding `[[rigs.overrides]] min_active_sessions = 1` blocks to
+# the city.toml(s) on this host.
+#
+# Why: the reconciler's poolDesired→scaleCheck→session.create path can
+# silently skip a spawn (poolDesired flap, stale session beads in active
+# count). Warm slots eliminate the cold-start path so the agent-watchdog
+# order is a backstop rather than the primary spawn engine. See
+# docs/agent-watchdog.md for the failure modes and docs/agent-scaling.md
+# for the schema.
+#
+# Idempotency: the script parses each city.toml, walks the [[rigs]]
+# blocks, and skips any rig that already has a matching override (same
+# agent, min_active_sessions=1). New blocks are appended at the end of
+# the rig's section, before the next [[rigs]] (or first non-rig top-level
+# table). Comments and surrounding whitespace are preserved.
+#
+# Default scan: every $HOME/<town>/city.toml that exists.
+# Pass explicit city.toml paths as positional args to override discovery.
+
+set -eu
+
+usage() {
+    cat <<'EOF'
+gc-warm-rig-pool — apply min_active_sessions=1 to rig-scoped agents.
+
+Usage:
+  gc-warm-rig-pool [options] [city.toml ...]
+
+Default scan: every $HOME/<town>/city.toml that exists.
+Pass explicit city.toml paths as positional args to override discovery.
+
+Options:
+  --agents=<list>   Comma-separated agent names to override (default:
+                    polecat,refinery).
+  --dry-run         Show planned changes without writing.
+  -h, --help        Show this help.
+
+Examples:
+  gc-warm-rig-pool                              # patch every city.toml under $HOME
+  gc-warm-rig-pool --dry-run                    # preview without writing
+  gc-warm-rig-pool ~/yggdrasil/city.toml        # explicit city
+  gc-warm-rig-pool --agents=polecat ~/asgard/city.toml  # polecat only
+EOF
+}
+
+DRY_RUN=0
+AGENTS="polecat,refinery"
+TARGETS=()
+
+die() { echo "gc-warm-rig-pool: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --agents=*) AGENTS="${1#--agents=}"; shift ;;
+        --agents) shift; AGENTS="${1:?--agents requires a value}"; shift ;;
+        --) shift; while [ $# -gt 0 ]; do TARGETS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) TARGETS+=("$1"); shift ;;
+    esac
+done
+
+if [ ${#TARGETS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -f "$d/city.toml" ] && TARGETS+=("$d/city.toml")
+    done
+fi
+
+[ ${#TARGETS[@]} -gt 0 ] || die "no city.toml files found under $HOME/*; pass explicit paths"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    die "python3 is required (uses tomllib for parsing only; rewrite is text-based)"
+fi
+
+PATCH_SCRIPT=$(cat <<'PYEOF'
+import sys, re
+
+# Pure text parser — no tomllib dependency so this works on python <3.11
+# (tomllib lands in 3.11; tomli is the historical backport but isn't part
+# of stdlib). All we need is structural detection of [[rigs]] blocks and
+# their nested [[rigs.overrides]] sub-blocks, which is straightforward to
+# do with regexes scoped to each rig's line range.
+
+agents = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
+src = sys.stdin.read()
+lines = src.split("\n")
+
+rig_header_re = re.compile(r"^\[\[rigs\]\]\s*$")
+overrides_header_re = re.compile(r"^\[\[rigs\.overrides\]\]\s*$")
+# Any other top-level [..] / [[..]] that isn't [[rigs]] or a [rigs.*]
+# sub-table closes the current rig block.
+top_other_re = re.compile(r"^\[(?:\[)?(?!rigs\b|rigs\.)[^\[\]]")
+# Nested subtables of rigs (e.g. [rigs.imports], [[rigs.overrides]]) stay
+# inside the current rig block.
+rig_subtable_re = re.compile(r"^\[(?:\[)?rigs\.")
+
+# Match a quoted string value: agent = "polecat"
+str_kv_re = re.compile(r'^([A-Za-z_][\w-]*)\s*=\s*"([^"]*)"\s*$')
+# Match an integer/bare value: min_active_sessions = 1
+num_kv_re = re.compile(r'^([A-Za-z_][\w-]*)\s*=\s*([0-9]+)\s*$')
+name_re = re.compile(r'^name\s*=\s*"([^"]*)"\s*$')
+
+# First pass: locate each [[rigs]] block as (start_line, end_line_exclusive).
+blocks = []
+i = 0
+while i < len(lines):
+    if rig_header_re.match(lines[i]):
+        start = i
+        j = i + 1
+        while j < len(lines):
+            ln = lines[j]
+            if rig_header_re.match(ln):
+                break
+            if (ln.startswith("[") and not rig_subtable_re.match(ln)
+                    and top_other_re.match(ln)):
+                break
+            j += 1
+        blocks.append({"start": start, "end": j})
+        i = j
+        continue
+    i += 1
+
+def parse_rig_block(start, end):
+    """Extract name + list of override dicts from a [[rigs]] block."""
+    name = None
+    overrides = []
+    in_override = False
+    cur = None
+    # The fields BEFORE any [rigs.*] subtable belong to the rig's top
+    # scope — that's where `name` lives.
+    in_top = True
+    for k in range(start + 1, end):
+        ln = lines[k].rstrip()
+        s = ln.lstrip()
+        if not s or s.startswith("#"):
+            continue
+        if overrides_header_re.match(s):
+            if cur is not None:
+                overrides.append(cur)
+            cur = {}
+            in_override = True
+            in_top = False
+            continue
+        if s.startswith("[") and rig_subtable_re.match(s):
+            # Some other [rigs.*] subtable (imports, etc.) — close any
+            # open override scope but keep scanning for top-level kvs.
+            if cur is not None:
+                overrides.append(cur)
+                cur = None
+            in_override = False
+            in_top = False
+            continue
+        if in_top:
+            m = name_re.match(s)
+            if m:
+                name = m.group(1)
+            continue
+        if in_override and cur is not None:
+            m = str_kv_re.match(s)
+            if m:
+                cur[m.group(1)] = m.group(2)
+                continue
+            m = num_kv_re.match(s)
+            if m:
+                cur[m.group(1)] = int(m.group(2))
+                continue
+    if cur is not None:
+        overrides.append(cur)
+    return name, overrides
+
+def has_override(overrides, agent_name):
+    # Any existing override block for this agent counts — including ones
+    # that set a different min_active_sessions value. If the operator
+    # has explicitly chosen a different value (or other fields), respect
+    # their choice instead of stacking another block.
+    for ov in overrides:
+        if ov.get("agent") == agent_name:
+            return True
+    return False
+
+changes = []  # (block_index, rig_name, [agents_to_add])
+for bi, block in enumerate(blocks):
+    rig_name, overrides = parse_rig_block(block["start"], block["end"])
+    missing = [a for a in agents if not has_override(overrides, a)]
+    if missing:
+        changes.append((bi, rig_name or f"<rig {bi}>", missing))
+
+if not changes:
+    sys.stdout.write(src)
+    sys.stderr.write("already warm: no changes\n")
+    sys.exit(0)
+
+out = list(lines)
+# Apply in reverse so earlier insertion points remain valid.
+for bi, rig_name, missing in reversed(changes):
+    block = blocks[bi]
+    insert_at = block["end"]
+    # Trim trailing blank lines inside the block so the new content
+    # appends cleanly without piling up whitespace.
+    while insert_at > block["start"] + 1 and out[insert_at - 1].strip() == "":
+        insert_at -= 1
+    snippet = []
+    for agent in missing:
+        snippet.extend([
+            "",
+            "[[rigs.overrides]]",
+            f'agent = "{agent}"',
+            "min_active_sessions = 1",
+        ])
+    out[insert_at:insert_at] = snippet
+    sys.stderr.write(
+        f"  + {rig_name}: add overrides for {', '.join(missing)}\n")
+
+sys.stdout.write("\n".join(out))
+PYEOF
+)
+
+ANY_CHANGED=0
+for target in "${TARGETS[@]}"; do
+    if [ ! -f "$target" ]; then
+        echo "skip (missing): $target"
+        continue
+    fi
+    echo "scan: $target"
+    tmp=$(mktemp)
+    if ! python3 -c "$PATCH_SCRIPT" "$AGENTS" <"$target" >"$tmp" 2>/tmp/gc-warm-rig-pool.err; then
+        cat /tmp/gc-warm-rig-pool.err >&2
+        rm -f "$tmp" /tmp/gc-warm-rig-pool.err
+        die "patch failed on $target"
+    fi
+    cat /tmp/gc-warm-rig-pool.err >&2
+    rm -f /tmp/gc-warm-rig-pool.err
+
+    if cmp -s "$target" "$tmp"; then
+        echo "  unchanged"
+        rm -f "$tmp"
+        continue
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  would patch (dry-run); diff:"
+        diff -u "$target" "$tmp" | sed 's/^/    /' || true
+        rm -f "$tmp"
+        continue
+    fi
+
+    cp "$target" "$target.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true
+    mv "$tmp" "$target"
+    echo "  patched"
+    ANY_CHANGED=1
+done
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$ANY_CHANGED" -eq 1 ]; then
+    cat <<'POSTEOF'
+
+Run `gc reload` (per city) to pick up the new min_active_sessions.
+Verify with:
+  gc config explain --agent polecat --rig <rig-name> | grep min_active_sessions
+POSTEOF
+fi

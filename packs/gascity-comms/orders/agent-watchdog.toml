@@ -1,0 +1,31 @@
+# agent-watchdog — backstop spawning for rig-scoped polecats and
+# refineries when the reconciler's poolDesired→scaleCheck→session.create
+# path doesn't translate the decision into an actual session.
+#
+# Background (also documented in ../../../docs/agent-watchdog.md):
+#   The supervisor logs `poolDesired: <rig>/<template> = N` correctly when
+#   work is queued, but two paths can prevent that decision from producing
+#   a spawn — (a) poolDesired flapping between consecutive ticks because
+#   the bead match window changes mid-cycle, so the higher count is never
+#   committed to a scaleCheck; (b) stale session beads (sessions whose
+#   tmux is gone but whose bead hasn't been reaped) inflate the active
+#   count, so scaleCheck thinks it has enough capacity. In both cases the
+#   reconciler silently skips the spawn and the queue stalls until a human
+#   runs `gc session new` manually.
+#
+# This order is the workaround. Each tick, for every rig in this city, it
+# checks each scaled template (refinery, polecat) and spawns a session if
+# work is queued and no live session can pick it up. min_active_sessions=1
+# (applied via packs/gascity-comms/assets/scripts/gc-warm-rig-pool) keeps
+# a warm slot so this watchdog is a backstop, not the primary scaling
+# path.
+#
+# 30s cadence: tighter than the reconciler's own pool loop, enough to
+# observe the spawn complete before the next tick. Idempotent — once a
+# session is live, subsequent ticks see live>0 and exit early.
+
+[order]
+description = "Backstop-spawn rig-scoped polecats/refineries when queued work has no live session"
+trigger = "cooldown"
+interval = "30s"
+exec = "$PACK_DIR/assets/scripts/agent-watchdog.sh"
