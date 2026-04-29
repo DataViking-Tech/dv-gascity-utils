@@ -107,6 +107,44 @@ patterns found`. Add `--dry-run` to preview without touching files,
 `--pack=<name>` to limit the rewrite to a single pack (e.g.
 `--pack=gastown`).
 
+## Pattern B — bare `pool` field in order/formula TOMLs
+
+A second alias-mismatch surface, same class of bug, different shape.
+Order TOMLs (and the formulas that template them) carry a `pool` field
+that names the agent template the order dispatches to. The supervisor's
+dispatch query expects the FQN form (`gastown.dog`), but stock pack
+TOMLs emit the bare role name (`dog`). Result: the supervisor never
+matches a real pool, the order's session never spawns, work piles up.
+
+(Tracking: mg-ovjgn. Validation set on midgard: 16 orphan beads recovered
+manually before the fixer extension landed — mg-201z+3, mg-gjr7+3,
+mg-oc06+3, mg-wg2cp+3, all with metadata.gc.routed_to flipped from `dog`
+to `gastown.dog`.)
+
+The fixer's pattern B detection (POSIX ERE):
+
+```
+^pool[[:space:]]*=[[:space:]]*"(refinery|polecat|witness|dog)"[[:space:]]*$
+```
+
+Anchored to line start and end, so the rewrite is intentionally NARROW:
+
+- `pool = "dog"` (whole line) — rewritten to `pool = "gastown.dog"`.
+- `pool: <rig>/dog` (label form, embedded) — handled by pattern A, not B.
+- `gateway_pool = "dog"`, `polecat_namepool = "..."` — not anchored to
+  bare `pool`, so untouched.
+- `pool = "dog-quotes-with-suffix"` — value not in the role vocabulary
+  (`refinery|polecat|witness|dog`), untouched.
+
+Scope is limited to `*.toml` (the `pool` field has no meaning in `.md`).
+
+The audit script (`gc-audit-alias-mismatch`) does NOT yet flag pattern B
+findings — extension pending. For now, dry-run the fixer to see them:
+
+```bash
+gc-fix-alias-mismatch --dry-run | grep 'pattern B'
+```
+
 ## Doctor check
 
 `packs/gascity-comms/doctor/check-alias-mismatch/run.sh` wraps the audit
