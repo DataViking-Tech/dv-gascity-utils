@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # gc-fix-alias-mismatch — rewrite short-form agent aliases to canonical
-# <rig>/gastown.<role> form across pack templates.
+# <rig>/gastown.<role> form across pack templates AND patch refinery
+# work-bead claim queries to strip min_active_sessions slot suffixes.
 #
 # WHAT this fixes:
-#   Pack templates that emit <rig>/<role> (or {{ .RigName }}/<role> or
-#   $GC_RIG/<role>) where the reconciler expects the FULL pack-prefixed
-#   agent name <rig>/gastown.<role>. The mismatch causes silent routing
-#   failures: assignments and pool-routing labels never match a real
-#   agent slot, so on-demand sessions never wake. (Tracking: dgu-fze,
-#   dgu-3u9, dgu-wrdjs, dgu-yykmt.)
+#   1. Pack templates that emit <rig>/<role> (or {{ .RigName }}/<role> or
+#      $GC_RIG/<role>) where the reconciler expects the FULL pack-prefixed
+#      agent name <rig>/gastown.<role>. The mismatch causes silent routing
+#      failures: assignments and pool-routing labels never match a real
+#      agent slot, so on-demand sessions never wake. (Tracking: dgu-fze,
+#      dgu-3u9, dgu-wrdjs, dgu-yykmt.)
+#
+#   2. Refinery work-bead claim queries that filter on $GC_AGENT/$GC_ALIAS
+#      verbatim. min_active_sessions=N spawn assigns suffixed slot aliases
+#      (e.g. <rig>/gastown.refinery-1) but polecats hand off work to the
+#      unsuffixed canonical alias. The fixer injects a base-alias
+#      derivation in the refinery patrol formula's find-work step and
+#      swaps the prompt-template's quick-reference row to use it; it also
+#      adds a corresponding "Alias Derivation" section to the prompt.
+#      (Tracking: dgu-hddn8.)
 #
 # Idempotent. Replaces and supersedes the narrower gc-fix-refinery-routing
 # (which only patched 3 files in the gastown pack). This helper covers
@@ -177,17 +187,95 @@ for pack in "${PACKS[@]}"; do
     done < <(grep -rlE "${INCLUDES[@]}" "$PATTERN_GREP" "$pack" 2>/dev/null || true)
 done
 
+# Pass 2: suffix-aware refinery claim. The companion gc-fix-alias-mismatch-suffix.pl
+# script does three transformations under perl -0777 (slurp mode) so
+# multi-line patterns and section injection work in one pass. See that
+# file for the full perl source.
+
+# Detection pattern for files that still have unfixed claim queries.
+SUFFIX_FIND_PATTERN='WORK=\$\(gc bd list --assignee=\$GC_AGENT --status=open|\| Find assigned work \|.*--assignee="\$GC_ALIAS" --status=open'
+
+SUFFIX_PERL_SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/gc-fix-alias-mismatch-suffix.pl"
+if [ ! -f "$SUFFIX_PERL_SCRIPT_PATH" ]; then
+    die "missing companion script: $SUFFIX_PERL_SCRIPT_PATH"
+fi
+
+suffix_changes=0
+suffix_files=0
+
+for pack in "${PACKS[@]}"; do
+    pack_name="$(basename "$pack")"
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        rel="${file#"$pack"/}"
+
+        # Tally expected substitutions: claim-query patterns + missing section
+        # (the latter only applies to refinery prompt files).
+        unfixed_queries=$(grep -cE "$SUFFIX_FIND_PATTERN" "$file" 2>/dev/null || true)
+        unfixed_queries="${unfixed_queries:-0}"
+
+        section_missing=0
+        case "$rel" in
+            *agents/refinery/prompt.template.md)
+                if grep -q '^## Sequential Rebase Protocol' "$file" 2>/dev/null \
+                   && ! grep -q '^## Alias Derivation' "$file" 2>/dev/null; then
+                    section_missing=1
+                fi
+                ;;
+        esac
+
+        expected=$((unfixed_queries + section_missing))
+        [ "$expected" -gt 0 ] || continue
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '  would fix [%d match(es), suffix-aware]: %s/%s\n' \
+                "$expected" "$pack_name" "$rel"
+            suffix_files=$((suffix_files + 1))
+            suffix_changes=$((suffix_changes + expected))
+            continue
+        fi
+
+        perl -i -0777 -p "$SUFFIX_PERL_SCRIPT_PATH" "$file"
+
+        after_queries=$(grep -cE "$SUFFIX_FIND_PATTERN" "$file" 2>/dev/null || true)
+        after_queries="${after_queries:-0}"
+        section_added=0
+        if [ "$section_missing" -eq 1 ] && grep -q '^## Alias Derivation' "$file" 2>/dev/null; then
+            section_added=1
+        fi
+        applied=$((unfixed_queries - after_queries + section_added))
+        [ "$applied" -gt 0 ] || continue
+
+        printf '  fixed [%d substitution(s), suffix-aware]: %s/%s\n' \
+            "$applied" "$pack_name" "$rel"
+        suffix_files=$((suffix_files + 1))
+        suffix_changes=$((suffix_changes + applied))
+    done < <(
+        {
+            # Files with unfixed claim queries.
+            grep -rlE "${INCLUDES[@]}" "$SUFFIX_FIND_PATTERN" "$pack" 2>/dev/null || true
+            # Refinery prompts may need section injection only.
+            find "$pack" -type f -path '*agents/refinery/prompt.template.md' 2>/dev/null || true
+        } | sort -u
+    )
+done
+
+# Combine totals across both passes.
+total_changes=$((total_changes + suffix_changes))
+files_changed=$((files_changed + suffix_files))
+
 echo
 if [ "$total_changes" -eq 0 ]; then
-    printf 'gc-fix-alias-mismatch: %d pack(s) scanned, no short-form patterns found.\n' "${#PACKS[@]}"
+    printf 'gc-fix-alias-mismatch: %d pack(s) scanned, no findings.\n' "${#PACKS[@]}"
     exit 0
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'gc-fix-alias-mismatch: %d substitution(s) across %d file(s) would be applied. Re-run without --dry-run to apply.\n' \
-        "$total_changes" "$files_changed"
+    printf 'gc-fix-alias-mismatch: %d substitution(s) would be applied (%d short-form, %d suffix-aware) across %d file-pass(es). Re-run without --dry-run to apply.\n' \
+        "$total_changes" "$((total_changes - suffix_changes))" "$suffix_changes" "$files_changed"
 else
-    printf 'gc-fix-alias-mismatch: %d substitution(s) across %d file(s).\n' \
-        "$total_changes" "$files_changed"
+    printf 'gc-fix-alias-mismatch: %d substitution(s) (%d short-form, %d suffix-aware) across %d file-pass(es).\n' \
+        "$total_changes" "$((total_changes - suffix_changes))" "$suffix_changes" "$files_changed"
     echo "Re-run gc-audit-alias-mismatch to verify; subsequent runs report 'no findings'."
 fi

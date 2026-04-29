@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gc-audit-alias-mismatch — find short-form agent alias mismatches across packs.
+# gc-audit-alias-mismatch — find agent alias mismatches across packs.
 #
 # WHY this exists:
 #   The reconciler's namedWorkReady check matches assignees against the FULL
@@ -10,19 +10,30 @@
 #   the only sign is "poolDesired" log lines that never fire. (Tracking:
 #   dgu-fze, dgu-3u9, dgu-wrdjs, dgu-yykmt.)
 #
+#   A second class of mismatch comes from min_active_sessions=N spawn:
+#   the runtime alias picks up a numeric slot suffix (e.g.
+#   <rig>/gastown.refinery-1), but polecats hand off work to the canonical
+#   unsuffixed form. Refinery work-bead claim queries that use $GC_AGENT
+#   or $GC_ALIAS verbatim never match. (Tracking: dgu-hddn8.)
+#
 # WHAT this finds:
-#   Anywhere a pack template emits the wrong alias form. Three rig-token
-#   variants are recognized (the canonical surface used in this codebase):
-#     <rig>           - literal placeholder in formula bodies + agent prompts
-#     {{ .RigName }}  - Go template variable, substituted at prompt-render time
-#     $GC_RIG         - shell variable used inside formula step scripts
-#   Followed by /<role> where role is one of the gastown agent base names
-#   (refinery, polecat, witness, dog) and NOT already prefixed gastown.*.
+#   1. Short-form alias references. Three rig-token variants:
+#        <rig>           - literal placeholder in formula bodies + prompts
+#        {{ .RigName }}  - Go template variable, substituted at render time
+#        $GC_RIG         - shell variable used inside formula step scripts
+#      Followed by /<role> where role is one of the gastown agent base names
+#      (refinery, polecat, witness, dog) and NOT already prefixed gastown.*.
+#
+#   2. Refinery work-bead claim queries that filter on $GC_AGENT/$GC_ALIAS
+#      verbatim (in mol-refinery-patrol.toml's find-work step or the
+#      refinery prompt's quick-reference table). Also flags refinery
+#      prompts that lack the "Alias Derivation" section explaining the
+#      base-alias derivation contract.
 #
 # Read-only. Pair with gc-fix-alias-mismatch to actually rewrite files.
 #
 # Exit codes:
-#   0 - no short-form findings (clean)
+#   0 - no findings (clean)
 #   1 - findings present (suitable for CI gating)
 #   2 - usage / invocation error
 
@@ -176,10 +187,89 @@ for pack in "${PACKS[@]}"; do
     PACK_COUNTS+=("$pack_count")
 done
 
+# Suffix-aware refinery claim findings. Two per-line patterns plus a
+# per-file "missing section" check on agents/refinery/prompt.template.md.
+# Suggested fixes describe the post-fixer state.
+SUFFIX_PATTERN_FORMULA='WORK=\$\(gc bd list --assignee=\$GC_AGENT --status=open'
+SUFFIX_PATTERN_PROMPT='\| Find assigned work \|.*--assignee="\$GC_ALIAS" --status=open'
+
+for pack in "${PACKS[@]}"; do
+    pack_name="$(basename "$pack")"
+    pack_count=0
+
+    # Per-line findings (formula + prompt quick-ref).
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        file="${line%%:*}"; rest="${line#*:}"
+        lineno="${rest%%:*}"; matched="${rest#*:}"
+        rel="${file#"$pack"/}"
+
+        case "$matched" in
+            *'WORK=$(gc bd list --assignee=$GC_AGENT --status=open'*)
+                alias_span='--assignee=$GC_AGENT'
+                suggested='--assignee="$REFINERY_ALIAS" (with REFINERY_ALIAS=$(printf %s "$GC_AGENT" | sed -E "s/-[0-9]+\$//"))' ;;
+            *'| Find assigned work |'*'--assignee="$GC_ALIAS"'*)
+                alias_span='--assignee="$GC_ALIAS"'
+                suggested='--assignee="$REFINERY_ALIAS"' ;;
+            *)
+                alias_span="$matched"
+                suggested='(suffix-aware claim)' ;;
+        esac
+
+        if [ "$JSON" -eq 1 ]; then
+            printf '{"pack":"%s","file":"%s","line":%s,"kind":"suffix-aware","match":"%s","suggested":"%s"}\n' \
+                "$pack_name" "$rel" "$lineno" "$alias_span" "$suggested"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf '  %s/%s:%s (suffix-aware)\n' "$pack_name" "$rel" "$lineno"
+            printf '    -- %s\n' "$alias_span"
+            printf '    ++ %s\n' "$suggested"
+        fi
+
+        found_total=$((found_total + 1))
+        pack_count=$((pack_count + 1))
+    done < <(grep -rn -E "${INCLUDES[@]}" "$SUFFIX_PATTERN_FORMULA|$SUFFIX_PATTERN_PROMPT" "$pack" 2>/dev/null || true)
+
+    # Per-file finding: refinery prompt missing the Alias Derivation section.
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        rel="${file#"$pack"/}"
+
+        # Only refinery prompt templates trigger this finding.
+        case "$rel" in
+            *agents/refinery/prompt.template.md) ;;
+            *) continue ;;
+        esac
+
+        if grep -q '^## Sequential Rebase Protocol' "$file" 2>/dev/null \
+           && ! grep -q '^## Alias Derivation' "$file" 2>/dev/null; then
+            if [ "$JSON" -eq 1 ]; then
+                printf '{"pack":"%s","file":"%s","line":0,"kind":"suffix-aware","match":"missing section","suggested":"## Alias Derivation"}\n' \
+                    "$pack_name" "$rel"
+            elif [ "$QUIET" -eq 0 ]; then
+                printf '  %s/%s (suffix-aware)\n' "$pack_name" "$rel"
+                printf '    -- missing section\n'
+                printf '    ++ ## Alias Derivation\n'
+            fi
+            found_total=$((found_total + 1))
+            pack_count=$((pack_count + 1))
+        fi
+    done < <(find "$pack" -type f -path '*agents/refinery/prompt.template.md' 2>/dev/null || true)
+
+    # Update the existing pack count entry to include suffix-aware findings.
+    # The new pass runs AFTER the existing loop populated PACK_NAMES, so we
+    # locate the index by name rather than relying on iteration order.
+    for i in "${!PACK_NAMES[@]}"; do
+        if [ "${PACK_NAMES[$i]}" = "$pack_name" ]; then
+            PACK_COUNTS[$i]=$(( PACK_COUNTS[$i] + pack_count ))
+            break
+        fi
+    done
+done
+
 if [ "$JSON" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     echo
     if [ "$found_total" -eq 0 ]; then
-        printf 'gc-audit-alias-mismatch: %d pack(s) scanned, no short-form findings.\n' "${#PACKS[@]}"
+        printf 'gc-audit-alias-mismatch: %d pack(s) scanned, no findings.\n' "${#PACKS[@]}"
     else
         printf 'gc-audit-alias-mismatch: %d finding(s) across %d pack(s):\n' \
             "$found_total" "${#PACKS[@]}"

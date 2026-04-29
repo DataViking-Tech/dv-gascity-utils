@@ -107,6 +107,42 @@ patterns found`. Add `--dry-run` to preview without touching files,
 `--pack=<name>` to limit the rewrite to a single pack (e.g.
 `--pack=gastown`).
 
+## The suffix-aware refinery claim
+
+A second class of mismatch shows up when `min_active_sessions=N` keeps
+one or more agent slots warm. The runtime spawns those slots with a
+numeric suffix (`<rig>/gastown.refinery-1`, `-2`, …), but polecats hand
+off work to the canonical unsuffixed alias `<rig>/gastown.refinery`. The
+refinery's claim query — historically `gc bd list --assignee=$GC_AGENT
+--status=open` — filters on the suffixed runtime alias verbatim and
+never matches the polecat's hand-off. The branch sits on origin and the
+warm refinery slot keeps watching events for assignments that never
+arrive. (Tracking: dgu-hddn8.)
+
+The fix introduces a `REFINERY_ALIAS` derivation that strips a trailing
+`-N` from the runtime alias and uses that base for work-bead claim
+queries while leaving wisp lookups, wisp assignments, and event watches
+on `$GC_ALIAS` (those are session-bound and the suffix is correct):
+
+```bash
+REFINERY_ALIAS=$(printf '%s' "$GC_AGENT" | sed -E 's/-[0-9]+$//')
+WORK=$(gc bd list --assignee="$REFINERY_ALIAS" --status=open ...)
+```
+
+`gc-fix-alias-mismatch` applies this in three places when it runs:
+
+1. `gastown/formulas/mol-refinery-patrol.toml` `find-work` step — inject
+   the derivation and swap the work-bead claim to use it.
+2. `gastown/agents/refinery/prompt.template.md` — insert an "Alias
+   Derivation" section before "Sequential Rebase Protocol" if missing.
+3. `gastown/agents/refinery/prompt.template.md` quick-reference row —
+   swap the work-bead claim from `$GC_ALIAS` to `$REFINERY_ALIAS`.
+
+The substitution lives in a companion file
+`gc-fix-alias-mismatch-suffix.pl` that the fixer invokes under
+`perl -0777 -p` (slurp mode) so the multi-line patterns and the section
+injection compose in one pass. Each rewrite is pattern-idempotent.
+
 ## Doctor check
 
 `packs/gascity-comms/doctor/check-alias-mismatch/run.sh` wraps the audit

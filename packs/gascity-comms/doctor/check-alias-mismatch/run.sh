@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Pack doctor check: short-form-vs-full-form agent alias mismatches.
+# Pack doctor check: agent alias mismatches.
 #
-# Walks every installed system pack and flags places where templates emit
-# short-form aliases (<rig>/<role>) instead of canonical <rig>/gastown.<role>.
-# These mismatches cause silent routing failures: the reconciler matches
-# assignees against the FULL pack-prefixed agent name, so short-form
-# assignments never wake the on-demand agent slot.
+# Walks every installed system pack and flags two classes of mismatch:
+#   1. Templates that emit short-form aliases (<rig>/<role>) instead of
+#      the canonical <rig>/gastown.<role>. These mismatches cause silent
+#      routing failures: the reconciler matches assignees against the
+#      FULL pack-prefixed agent name, so short-form assignments never
+#      wake the on-demand agent slot.
+#   2. Refinery work-bead claim queries that filter on $GC_AGENT/$GC_ALIAS
+#      verbatim. min_active_sessions=N spawn assigns suffixed slot
+#      aliases; polecats hand off to the unsuffixed canonical form, so
+#      verbatim filters never match. (Tracking: dgu-hddn8.)
 #
 # Implementation: forwards to gc-audit-alias-mismatch. Pair with
 # gc-fix-alias-mismatch to repair findings.
@@ -36,10 +41,10 @@ ec=0
 
 case "$ec" in
     0)
-        echo "no short-form agent alias mismatches in installed system packs"
+        echo "no agent alias mismatches in installed system packs"
         exit 0 ;;
     1)
-        echo "short-form agent alias mismatches found in installed system packs"
+        echo "agent alias mismatches found in installed system packs"
         echo
         echo "Run gc-fix-alias-mismatch to apply canonical replacements."
         echo
