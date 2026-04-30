@@ -10,6 +10,7 @@ DataViking-Tech utilities and patterns for [Gas City](https://docs.gascityhall.c
 
 ### Docs
 
+- **`docs/new-city-bootstrap.md`** — start here when scaffolding a new host. Walks the `gc-city-bootstrap` script + the manual follow-up checklist (city init, peers.toml, token distribution, polecat scaling, verification).
 - **`docs/multi-city-shared-dolt.md`** — running multiple cities (each with its own gc supervisor) against a single shared Dolt server, including how rigs partition into separate databases by prefix and how cross-city mail flows between them.
 - **`docs/cross-city-comms.md`** — the architecture: per-host Caddy gateway on the Tailscale interface, bearer auth, `peers.toml` registry, the `gcx` wrapper, the in-band `X-Gascity-Origin` header convention for reply routing, and the per-city `mail-nudge` order for autonomous wake-on-arrival.
 - **`docs/cross-city-mail-protocol.md`** — payload-level contract for cross-city wisps: why `X-Gascity-Origin` lives in body line 1 (canonical) vs. the HTTP header (forward-compat only, currently dropped by both gateway receive paths), how `gcx mail reply` parses it, and the sender contract for raw-curl callers.
@@ -25,9 +26,37 @@ DataViking-Tech utilities and patterns for [Gas City](https://docs.gascityhall.c
 
 Pre-alpha. Built during initial multi-city setup of `yggdrasil` (HQ on `mani-mac-mini`), `midgard` (`sol-mac-mini`), and `asgard` (external-agent home, also on mani-mac-mini). Patterns and pack contents are evolving as the architecture firms up.
 
-## Importing the pack
+## Bootstrapping a new host
 
-Until `gc pack add <git-url>` is wired up here, the bootstrap is manual:
+The fast path is `gc-city-bootstrap`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DataViking-Tech/dv-gascity-utils/main/packs/gascity-comms/assets/scripts/gc-city-bootstrap \
+    -o /tmp/gc-city-bootstrap
+chmod +x /tmp/gc-city-bootstrap
+/tmp/gc-city-bootstrap --dry-run    # preview
+/tmp/gc-city-bootstrap              # apply
+```
+
+The script clones dv-gascity-utils, symlinks the helpers into
+`~/.gc/bin/`, generates a gateway token, drops a Caddyfile + LaunchAgents,
+and runs the `gc-fix-*` helpers once against any installed city packs.
+It's idempotent — re-running on a partially-set-up host is safe.
+
+What stays manual (operator decisions the script can't make for you):
+
+- `gc init <city-name>` and `gc rig add` for each project
+- Editing `~/.gc/peers.toml` from the template + distributing your
+  gateway token to peer hosts via secure channel
+- Polecat warm-pool overrides in `city.toml` (per-rig decision; see
+  `docs/agent-scaling.md`)
+
+End-to-end recipe with the manual checklist: **`docs/new-city-bootstrap.md`**.
+
+## Importing the pack manually
+
+If you need to apply the gascity-comms pack to a city without running
+the bootstrap script:
 
 ```bash
 git clone https://github.com/DataViking-Tech/dv-gascity-utils ~/dv-gascity-utils
@@ -37,18 +66,14 @@ git clone https://github.com/DataViking-Tech/dv-gascity-utils ~/dv-gascity-utils
 gc reload
 ```
 
-Then per-host:
+Per-host symlinks the bootstrap script handles automatically:
 
 ```bash
-ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gcx ~/.gc/bin/gcx
-ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-rig-join ~/.gc/bin/gc-rig-join
-ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-audit-alias-mismatch ~/.gc/bin/gc-audit-alias-mismatch
-ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-fix-alias-mismatch ~/.gc/bin/gc-fix-alias-mismatch
-# gc-fix-refinery-routing is now a deprecation shim that forwards to
-# gc-fix-alias-mismatch — keep it symlinked only if you have existing
-# scripts or muscle memory that calls it by its old name:
-ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-fix-refinery-routing ~/.gc/bin/gc-fix-refinery-routing
-ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-fix-merge-strategy ~/.gc/bin/gc-fix-merge-strategy
+for h in gcx gc-rig-join gc-audit-alias-mismatch gc-fix-alias-mismatch \
+         gc-fix-refinery-routing gc-fix-merge-strategy gc-fix-watch \
+         gc-warm-rig-pool gc-tune-refinery-loop gc-city-bootstrap; do
+    ln -sf "$HOME/dv-gascity-utils/packs/gascity-comms/assets/scripts/$h" "$HOME/.gc/bin/$h"
+done
 cp ~/dv-gascity-utils/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
 # fill in url + token_file for each peer
 ```
