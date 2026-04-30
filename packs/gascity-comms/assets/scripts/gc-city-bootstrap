@@ -117,6 +117,7 @@ HELPERS=(
     "gc-fix-runtime-restart"
     "gc-fix-watch"
     "gc-events-rotate"
+    "gc-rig-init"
     "gc-rig-join"
     "gc-warm-rig-pool"
     "gc-tune-refinery-loop"

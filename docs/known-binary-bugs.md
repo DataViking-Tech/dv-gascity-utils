@@ -237,6 +237,59 @@ The archive files are preserved as historical record; prune by adjusting `--reta
 
 ---
 
+## gc rig add: broken includes shape + incomplete bd init
+
+**Trackers**: `dgu-ogey6` (open).
+
+**Symptom**: two distinct breakages encountered when adding a rig with `gc rig add`:
+
+1. **Includes block doesn't expand.** `gc rig add /path --include packs/gastown` writes:
+   ```toml
+   [[rigs]]
+   name = "<rig>"
+   includes = ["packs/gastown"]
+   ```
+   This shape is rejected at config load with `expanding packs: rig "<rig>" pack "packs/gastown": loading pack.toml: open <city>/packs/gastown/pack.toml: no such file or directory`. The bare relative path resolves against the city root, not `.gc/system/packs/`. Working form (used by every other rig in city.toml):
+   ```toml
+   [[rigs]]
+   name = "<rig>"
+   [rigs.imports]
+   [rigs.imports.gastown]
+   source = ".gc/system/packs/gastown"
+   ```
+
+2. **Schema bootstrap is incomplete.** After `gc rig add` reports `Initialized beads database` and writes the .beads/ files, `bd list` works (returns empty) but `bd create` fails with `database not initialized: issue_prefix config is missing` — even though `config.yaml` clearly contains `issue_prefix: <p>`. Re-running `bd init --force --prefix <p>` in the rig dir completes the missing schema half.
+
+**Evidence**: yg, 2026-04-30, while adding `dataviking-site` rig.
+
+**Why no Class B**: pack-template-resilience (gc-fix-watch) operates on the gastown pack tree; this is a config + dolt-table state issue specific to per-rig setup. Different surface.
+
+**Workaround (Class A)**: `gc-rig-init` wrapper helper handles both bugs in one command, plus auto-applies the standard polecat (min_active=0) + refinery (min_active=1) scaling overrides. Idempotent.
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-rig-init \
+    ~/.gc/bin/gc-rig-init
+
+# Add a new rig (one command, no manual fixups)
+gc-rig-init /path/to/myproject
+
+# Custom prefix or no pack import
+gc-rig-init /path/to/myproject --prefix mp --no-include
+
+# Preview without changes
+gc-rig-init --dry-run /path/to/myproject
+```
+
+The wrapper:
+1. Calls `gc rig add` (skipped if rig already in city.toml).
+2. Detects + rewrites the broken `includes = [...]` block to the expanding `[rigs.imports.<pack>] source = ...` form.
+3. Adds `[[rigs.overrides]]` blocks for polecat (min_active=0) and refinery (min_active=1) if not already present.
+4. Probes `bd create`. If it succeeds, init is healthy. If it returns the schema error, runs `bd init --force --prefix <p>`. If the rig has existing beads, skips init (the binary safety check would refuse anyway).
+
+`gc-city-bootstrap` symlinks `gc-rig-init` automatically — fresh hosts get it without extra setup.
+
+---
+
 ## jsonl-export.sh column rename type → issue_type
 
 **Trackers**: `mg-yras` (closed — workaround applied).
