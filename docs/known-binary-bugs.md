@@ -164,7 +164,7 @@ Full sequence in `docs/diagnostic-runbook.md` — "Safe restart sequence".
 
 ## gc runtime request-restart panics with select-no-cases deadlock
 
-**Trackers**: `mg-fl2u8` (open).
+**Trackers**: `mg-fl2u8` (closed per 2026-04-30 directive — no binary modifications planned), `dgu-fl2u8` (closed mirror), `yg-ueadi` (closed dup filed by synth-panel/gastown.witness 2026-04-30 hitting it during patrol).
 
 **Symptom**: `gc runtime request-restart` (called by deacon and other agents to signal a clean restart) panics with Go runtime deadlock detection instead of blocking until the controller kills the session.
 
@@ -176,7 +176,18 @@ main.doRuntimeRequestRestart cmd_runtime_drain.go:462 +0x158
 
 **Why this happens**: the implementation uses a `select{}` with no cases, which Go's runtime detects as definite deadlock at goroutine 1. Should be a blocking channel or signal-bound context instead.
 
-**Workaround**: none. The metadata side-effect (`GC_RESTART_REQUESTED`) may or may not be set before the panic; agents calling this should NOT depend on the contract. Reconcile via the controller's metadata watcher instead.
+**Workaround (Class B)**: replace `gc runtime request-restart` with `gc runtime drain-ack && exit` in agent formulas. drain-ack signals the controller to stop the session (the polecat done-and-exit pattern); controller respawns from the agent template (driven by `min_active_sessions` or queued work), and the new session picks up the next wisp from its hook.
+
+`gc-fix-runtime-restart` patches the 4 affected formulas (mol-witness-patrol, mol-deacon-patrol, mol-refinery-patrol, mol-polecat-work) in the gastown pack. `gc-fix-watch` re-applies after every templater wipe — same pattern as `gc-fix-merge-strategy` and `gc-fix-alias-mismatch`.
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-fix-runtime-restart \
+    ~/.gc/bin/gc-fix-runtime-restart
+gc-fix-runtime-restart                       # patch every host town
+gc-fix-runtime-restart --dry-run ~/yggdrasil # preview one town
+```
+
+The metadata side-effect (`GC_RESTART_REQUESTED`) is no longer the contract anyone depends on after this fix.
 
 ---
 

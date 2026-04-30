@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# gc-fix-runtime-restart — replace broken `gc runtime request-restart` with
+# the working `gc runtime drain-ack && exit` pattern in agent formulas.
+#
+# WHY:
+#   `gc runtime request-restart` panics with "all goroutines asleep -
+#   deadlock! select (no cases)" at cmd_runtime_drain.go:462. Tracker:
+#   mg-fl2u8 / dgu-fl2u8 (closed per 2026-04-30 directive — no binary
+#   modifications). The replacement command is `gc runtime drain-ack`
+#   followed by `exit` — semantically equivalent to what request-restart
+#   was supposed to do (signal controller, terminate, controller
+#   respawns). Polecats already use drain-ack at end-of-cycle; this just
+#   makes patrol agents (witness, deacon, refinery) follow the same
+#   pattern.
+#
+# Files patched (skipped silently if absent):
+#   formulas/mol-witness-patrol.toml
+#   formulas/mol-deacon-patrol.toml
+#   formulas/mol-refinery-patrol.toml
+#   formulas/mol-polecat-work.toml
+#
+# Idempotent: marker check. Once the standalone bare-line and inline
+# backtick-wrapped references are gone, the helper reports "already
+# fixed".
+#
+# Pair with gc-fix-watch — the watcher will re-apply automatically after
+# every supervisor templater wipe.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-runtime-restart — replace broken request-restart with drain-ack && exit.
+
+Usage:
+  gc-fix-runtime-restart [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/gastown that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-fix-runtime-restart                       # scan ~/* and patch every gastown pack
+  gc-fix-runtime-restart --dry-run             # preview without writing
+  gc-fix-runtime-restart ~/yggdrasil ~/asgard  # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-fix-runtime-restart: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+command -v perl >/dev/null 2>&1 || die "perl is required but not installed"
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs/gastown" ] && ROOTS+=("$d")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || die "no .gc/system/packs/gastown trees found under $HOME/*; pass an explicit town root"
+fi
+
+# Two patterns:
+#   (1) Standalone bare-line command in bash blocks:
+#         gc runtime request-restart
+#       → rewrite to:
+#         gc runtime drain-ack && exit
+#
+#   (2) Inline backtick-wrapped reference (Markdown tables / prose):
+#         `gc runtime request-restart`
+#       → rewrite to:
+#         `gc runtime drain-ack && exit`
+#
+# Both are anchored exactly so we don't rewrite hypothetical other
+# surfaces (e.g., a comment that says "the request-restart command is
+# broken — use ..." would NOT match because the helper only rewrites
+# the command itself).
+
+PERL_BARE='s{^gc runtime request-restart\s*$}{gc runtime drain-ack && exit}'
+PERL_INLINE='s{`gc runtime request-restart`}{`gc runtime drain-ack && exit`}g'
+
+# Detection greps. If neither matches, the file is already fixed.
+GREP_BARE='^gc runtime request-restart\s*$'
+GREP_INLINE='`gc runtime request-restart`'
+
+TARGET_FILES=(
+    "formulas/mol-witness-patrol.toml"
+    "formulas/mol-deacon-patrol.toml"
+    "formulas/mol-refinery-patrol.toml"
+    "formulas/mol-polecat-work.toml"
+)
+
+files_changed=0
+files_skipped=0
+files_already_fixed=0
+
+for town in "${ROOTS[@]}"; do
+    pack_root="$town/.gc/system/packs/gastown"
+    [ -d "$pack_root" ] || { echo "  skip: $town (no gastown pack)"; continue; }
+    town_label="$(basename "$town")"
+
+    for rel in "${TARGET_FILES[@]}"; do
+        file="$pack_root/$rel"
+        if [ ! -f "$file" ]; then
+            files_skipped=$((files_skipped + 1))
+            continue
+        fi
+
+        bare_count=$(grep -cE "$GREP_BARE" "$file" 2>/dev/null || true)
+        bare_count="${bare_count:-0}"
+        inline_count=$(grep -cF -- "$GREP_INLINE" "$file" 2>/dev/null || true)
+        inline_count="${inline_count:-0}"
+        total=$((bare_count + inline_count))
+
+        if [ "$total" -eq 0 ]; then
+            echo "  ok (already fixed): $town_label/$rel"
+            files_already_fixed=$((files_already_fixed + 1))
+            continue
+        fi
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '  would fix [%d bare + %d inline = %d]: %s/%s\n' \
+                "$bare_count" "$inline_count" "$total" "$town_label" "$rel"
+            files_changed=$((files_changed + 1))
+            continue
+        fi
+
+        # Run both substitutions. Combine with `; ` so perl applies them
+        # sequentially in one pass.
+        perl -i -pe "$PERL_BARE; $PERL_INLINE" "$file"
+
+        # Verify rewrite landed.
+        bare_after=$(grep -cE "$GREP_BARE" "$file" 2>/dev/null || true)
+        bare_after="${bare_after:-0}"
+        inline_after=$(grep -cF -- "$GREP_INLINE" "$file" 2>/dev/null || true)
+        inline_after="${inline_after:-0}"
+        applied=$((total - bare_after - inline_after))
+
+        if [ "$applied" -le 0 ]; then
+            printf '  warn: no changes applied to %s/%s (matched but rewrite did nothing)\n' \
+                "$town_label" "$rel" >&2
+            continue
+        fi
+
+        printf '  fixed [%d substitution(s)]: %s/%s\n' "$applied" "$town_label" "$rel"
+        files_changed=$((files_changed + 1))
+    done
+done
+
+echo
+if [ "$files_changed" -eq 0 ] && [ "$files_already_fixed" -gt 0 ]; then
+    printf 'gc-fix-runtime-restart: %d file(s) already fixed; nothing to do.\n' "$files_already_fixed"
+elif [ "$DRY_RUN" -eq 1 ]; then
+    printf 'gc-fix-runtime-restart: %d file(s) would be patched. Re-run without --dry-run to apply.\n' "$files_changed"
+else
+    printf 'gc-fix-runtime-restart: %d file(s) patched, %d already fixed.\n' "$files_changed" "$files_already_fixed"
+fi
