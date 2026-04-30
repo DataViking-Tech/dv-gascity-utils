@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# gc-rig-init — wrap `gc rig add` with the post-add fixups it should do itself.
+#
+# Two known binary bugs (tracking dgu-ogey6):
+#
+#   1. `gc rig add --include packs/gastown` writes a broken `includes = [...]`
+#      block in city.toml that doesn't expand correctly. The working form is
+#      a `[rigs.imports.<name>] source = ".gc/system/packs/<name>"` block.
+#
+#   2. `gc rig add` initializes .beads/ files but the dolt-table side of the
+#      schema bootstrap is missing — `bd list` works but `bd create` fails
+#      with "issue_prefix config is missing". `bd init --force --prefix <p>`
+#      completes the missing half.
+#
+# This helper:
+#
+#   1. Invokes `gc rig add <path> [--include <pack>]` (skipped if rig
+#      already registered).
+#   2. Rewrites the broken `includes = [...]` block in city.toml to the
+#      expanding `[rigs.imports.<pack>] source = ".gc/system/packs/<pack>"`
+#      form.
+#   3. Runs `bd init --force --prefix <p>` in the rig directory.
+#   4. Adds the standard polecat/refinery scaling overrides
+#      (polecat min_active=0, refinery min_active=1) to match the rest of
+#      the city.
+#
+# Idempotent: re-running on a fully-set-up rig is a no-op (apart from the
+# `bd init --force` which is itself idempotent — it rewrites the schema
+# from the existing prefix).
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-rig-init — wrapper for `gc rig add` with post-add fixups.
+
+Usage:
+  gc-rig-init <rig-path> [options]
+
+Required:
+  <rig-path>          Absolute path to the rig directory (must be a git repo).
+
+Options:
+  --name <name>       Rig name. Default: basename of rig-path.
+  --include <pack>    System pack to include (default: gastown).
+                      Use --no-include to skip the imports block entirely.
+  --no-include        Don't add any pack import.
+  --prefix <prefix>   Bead ID prefix. Default: derived from name (per gc binary).
+  --no-scaling        Don't add the polecat/refinery scaling overrides.
+  --dry-run           Print what would happen; touch nothing.
+  -h, --help          Show this help.
+
+Examples:
+  gc-rig-init /Users/mani/dataviking-site
+  gc-rig-init /Users/mani/myproject --include gastown --prefix myp
+  gc-rig-init ~/foo --dry-run
+EOF
+}
+
+RIG_PATH=""
+RIG_NAME=""
+INCLUDE_PACK="gastown"
+NO_INCLUDE=0
+PREFIX=""
+NO_SCALING=0
+DRY_RUN=0
+
+die() { echo "gc-rig-init: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --name) shift; [ $# -gt 0 ] || die "--name requires an argument"; RIG_NAME="$1"; shift ;;
+        --name=*) RIG_NAME="${1#--name=}"; shift ;;
+        --include) shift; [ $# -gt 0 ] || die "--include requires an argument"; INCLUDE_PACK="$1"; shift ;;
+        --include=*) INCLUDE_PACK="${1#--include=}"; shift ;;
+        --no-include) NO_INCLUDE=1; INCLUDE_PACK=""; shift ;;
+        --prefix) shift; [ $# -gt 0 ] || die "--prefix requires an argument"; PREFIX="$1"; shift ;;
+        --prefix=*) PREFIX="${1#--prefix=}"; shift ;;
+        --no-scaling) NO_SCALING=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -*) die "unknown option: $1" ;;
+        *)
+            if [ -z "$RIG_PATH" ]; then
+                RIG_PATH="$1"
+            else
+                die "unexpected argument: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$RIG_PATH" ] || { usage; exit 2; }
+[ -d "$RIG_PATH" ] || die "rig path does not exist: $RIG_PATH"
+
+# Make absolute.
+RIG_PATH="$(cd "$RIG_PATH" && pwd)"
+[ -z "$RIG_NAME" ] && RIG_NAME="$(basename "$RIG_PATH")"
+
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[gc-rig-init] would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+log() { printf '[gc-rig-init] %s\n' "$*"; }
+warn() { printf '[gc-rig-init] warn: %s\n' "$*" >&2; }
+
+# Find the city root (first directory walking up from cwd that has a city.toml).
+find_city_root() {
+    local d="$PWD"
+    while [ "$d" != "/" ]; do
+        if [ -f "$d/city.toml" ]; then
+            echo "$d"
+            return 0
+        fi
+        d="$(dirname "$d")"
+    done
+    return 1
+}
+
+CITY_ROOT="$(find_city_root)"
+[ -n "$CITY_ROOT" ] || die "no city.toml found walking up from $PWD"
+CITY_TOML="$CITY_ROOT/city.toml"
+log "city: $CITY_ROOT"
+log "rig:  $RIG_PATH (name=$RIG_NAME)"
+
+# --- Step 1: gc rig add (skip if already in city.toml) ---
+
+ALREADY_IN_CITY=0
+if grep -qE "^name = \"$RIG_NAME\"$" "$CITY_TOML" 2>/dev/null; then
+    log "step 1/4: rig '$RIG_NAME' already in city.toml; skipping 'gc rig add'"
+    ALREADY_IN_CITY=1
+else
+    log "step 1/4: invoking 'gc rig add'"
+    if [ "$NO_INCLUDE" -eq 1 ]; then
+        run gc rig add "$RIG_PATH" --name "$RIG_NAME"
+    else
+        run gc rig add "$RIG_PATH" --name "$RIG_NAME" --include "packs/$INCLUDE_PACK"
+    fi
+fi
+
+# --- Step 2: rewrite broken includes block (if present) ---
+
+if [ "$NO_INCLUDE" -eq 0 ] && [ -n "$INCLUDE_PACK" ]; then
+    log "step 2/4: checking city.toml includes shape for rig '$RIG_NAME'"
+
+    # Detect the broken `includes = ["packs/<pack>"]` shape under our rig
+    # block. Use a small perl program to operate on the file as a whole
+    # since the broken block spans multiple lines.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if grep -qE "includes = \[\"packs/$INCLUDE_PACK\"\]" "$CITY_TOML"; then
+            log "would rewrite broken includes block for rig '$RIG_NAME'"
+        else
+            log "no broken includes block found; nothing to rewrite"
+        fi
+    else
+        perl -i -0pe "
+            s{
+                (\\[\\[rigs\\]\\]\\s*\\n
+                 name\\s*=\\s*\"$RIG_NAME\"\\s*\\n
+                )
+                includes\\s*=\\s*\\[\"packs/$INCLUDE_PACK\"\\]\\s*\\n
+            }{
+                \$1 .
+                qq{[rigs.imports]\n[rigs.imports.$INCLUDE_PACK]\nsource = \".gc/system/packs/$INCLUDE_PACK\"\n}
+            }gxe
+        " "$CITY_TOML"
+
+        # Verify rewrite landed.
+        if grep -qE "includes = \[\"packs/$INCLUDE_PACK\"\]" "$CITY_TOML"; then
+            warn "broken includes block still present in $CITY_TOML — manual fix required"
+        else
+            if grep -qE "rigs.imports.$INCLUDE_PACK" "$CITY_TOML"; then
+                log "  imports block uses expanding source form"
+            fi
+        fi
+    fi
+fi
+
+# --- Step 3: scaling overrides ---
+
+if [ "$NO_SCALING" -eq 0 ]; then
+    log "step 3/4: ensuring polecat + refinery scaling overrides for rig '$RIG_NAME'"
+
+    # Look for any existing scaling override block under this rig. If not
+    # present, append. We append at the end of the rig's block, before
+    # the next [[rigs]] or top-level [section].
+    if grep -qE "^\\[\\[rigs.overrides\\]\\]$" "$CITY_TOML"; then
+        # The toml file uses [[rigs.overrides]] blocks. Check if our rig's
+        # block has one. Crude heuristic: search the slice between this
+        # rig's [[rigs]] and the next [[rigs]] or top-level header for
+        # an overrides line.
+        perl -e "
+            use strict; use warnings;
+            open my \$fh, '<', '$CITY_TOML' or die \$!;
+            local \$/; my \$content = <\$fh>; close \$fh;
+
+            # Find this rig's slice — body extends until the NEXT [[rigs]]
+            # block (not [[rigs.overrides]] which is nested under this rig's
+            # block) or until the next top-level [orders]/[workspace] header.
+            # Lookaheads are ONLY anchored at line start.
+            my \$pat = qr/(\\[\\[rigs\\]\\]\\s*\\n[^\\[]*?name\\s*=\\s*\"$RIG_NAME\"\\s*\\n)((?:(?!^\\[\\[rigs\\]\\]\\s*\$)(?!^\\[orders\\])(?!^\\[workspace\\])(?!^\\[providers\\]).)*)/sm;
+            if (\$content =~ \$pat) {
+                my \$head = \$1;
+                my \$body = \$2;
+                if (\$body =~ /agent\\s*=\\s*\"polecat\"/) {
+                    print \"has-polecat-override\\n\";
+                } else {
+                    print \"missing-polecat-override\\n\";
+                }
+            } else {
+                print \"rig-not-found\\n\";
+            }
+        " > /tmp/gc-rig-init.check 2>&1
+
+        STATE="$(cat /tmp/gc-rig-init.check)"
+        rm -f /tmp/gc-rig-init.check
+
+        case "$STATE" in
+            has-polecat-override)
+                log "  polecat override already present; leaving city.toml alone"
+                ;;
+            missing-polecat-override)
+                if [ "$DRY_RUN" -eq 1 ]; then
+                    log "  would append polecat (min_active=0) + refinery (min_active=1) overrides"
+                else
+                    # Insert overrides immediately after the imports block
+                    # for our rig. Match: end of [rigs.imports.<pack>] block
+                    # (the source = "..." line) under our rig's [[rigs]].
+                    perl -i -0pe "
+                        s{
+                            (\\[\\[rigs\\]\\]\\s*\\n
+                             name\\s*=\\s*\"$RIG_NAME\"\\s*\\n
+                             (?:(?!\\[\\[rigs).)*?
+                             source\\s*=\\s*\"[^\"]+\"\\s*\\n
+                            )
+                        }{
+                            \$1 .
+                            qq{\n[[rigs.overrides]]\nagent = \"polecat\"\nmin_active_sessions = 0\n\n[[rigs.overrides]]\nagent = \"refinery\"\nmin_active_sessions = 1\n}
+                        }sxe
+                    " "$CITY_TOML"
+                    log "  appended polecat + refinery scaling overrides"
+                fi
+                ;;
+            rig-not-found)
+                warn "could not locate rig '$RIG_NAME' block in city.toml; skipping scaling overrides"
+                ;;
+        esac
+    fi
+fi
+
+# --- Step 4: bd init --force ---
+
+if [ -z "$PREFIX" ]; then
+    if [ -f "$RIG_PATH/.beads/config.yaml" ]; then
+        PREFIX="$(awk -F': *' '/^issue_prefix:/{print $2; exit}' "$RIG_PATH/.beads/config.yaml" 2>/dev/null || true)"
+    fi
+fi
+
+if [ -z "$PREFIX" ]; then
+    warn "could not determine bead prefix for rig '$RIG_NAME'; skipping 'bd init'"
+else
+    log "step 4/4: completing bd schema bootstrap (prefix=$PREFIX)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "would probe bd create; run 'bd init --force --prefix $PREFIX' only if probe fails AND rig has 0 beads"
+    else
+        # The bd commands here are EXPECTED to fail in some configurations
+        # (that's the bug we work around). Disable set -e for the probe
+        # block; restore at the end.
+        set +e
+        cd "$RIG_PATH"
+
+        # Count existing beads (any status) — if any, the rig is bootstrapped.
+        # `bd list` itself can fail in the schema-incomplete case; treat
+        # any failure as "0 beads" and fall through to the probe path.
+        BD_LIST_OUT=$(bd list --status=open --json 2>&1)
+        if echo "$BD_LIST_OUT" | grep -q "issue_prefix config is missing"; then
+            BEAD_COUNT=0
+        else
+            BEAD_COUNT=$(echo "$BD_LIST_OUT" | grep -oE '"id":"[a-z]+-[a-z0-9]+"' | wc -l | tr -d ' ')
+            BEAD_COUNT="${BEAD_COUNT:-0}"
+        fi
+
+        if [ "$BEAD_COUNT" -gt 0 ]; then
+            log "  rig has $BEAD_COUNT existing bead(s); skipping init (already bootstrapped)"
+        else
+            # Probe with a real bd create. If it succeeds, init is healthy.
+            PROBE_OUT=$(bd create "gc-rig-init probe" -t task -p 4 -d "probe; safe to close" 2>&1)
+            if echo "$PROBE_OUT" | grep -q "Created issue"; then
+                PROBE_ID=$(echo "$PROBE_OUT" | grep -oE '[a-z]+-[a-z0-9]+' | head -1)
+                [ -n "$PROBE_ID" ] && bd update "$PROBE_ID" --status=closed --notes "gc-rig-init probe complete" >/dev/null 2>&1
+                log "  bd already healthy (probe $PROBE_ID created + closed); no init needed"
+            elif echo "$PROBE_OUT" | grep -q "issue_prefix config is missing"; then
+                log "  bd schema incomplete; running 'bd init --force --prefix $PREFIX'"
+                bd init --force --prefix "$PREFIX" 2>&1 | tail -3 | sed 's/^/    /'
+            else
+                warn "bd probe failed with unexpected output:"
+                echo "$PROBE_OUT" | sed 's/^/    /' >&2
+                warn "leaving rig as-is; investigate manually"
+            fi
+        fi
+        cd - >/dev/null
+        set -e
+    fi
+fi
+
+log "done."
+log ""
+log "Verify: gc rig status $RIG_NAME"
+log "        gc bd list --rig=$RIG_NAME"
