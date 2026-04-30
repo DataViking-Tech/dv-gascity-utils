@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# gc-city-bootstrap — host-local prep for a new Gas City deployment.
+#
+# What this script does (idempotent, safe to re-run):
+#
+#   1. Clones (or fast-forwards) ~/dv-gascity-utils.
+#   2. Symlinks the gascity-comms helpers into ~/.gc/bin/.
+#   3. Generates a per-host gateway token if missing.
+#   4. Drops a Caddyfile + launchd plist for the gateway, substituting
+#      {{HOME}} and {{TS_IP}} in templates.
+#   5. Drops the gc-fix-watch LaunchAgent plist with {{HOME}}.
+#   6. Loads both LaunchAgents (gateway + fix-watch).
+#   7. Runs each gc-fix-* helper once against discovered towns to
+#      apply the in-place pack patches that survive templater wipes.
+#
+# What this script does NOT do (manual still required):
+#
+#   - gc init <city-name> + gc rig add — depends on the operator's
+#     intended rig topology.
+#   - peers.toml editing + token distribution to peer hosts — these
+#     are security-sensitive and require coordination with peer
+#     operators.
+#   - Tailscale IP override — auto-detected via `tailscale ip -4` when
+#     available, falls back to interactive prompt or --ts-ip flag.
+#   - Polecat min_active config in city.toml — Mayor's job; depends on
+#     rig profile (see docs/agent-scaling.md "Cost of warm pools").
+#
+# After this script: read docs/new-city-bootstrap.md for the manual
+# follow-up steps + verification checklist.
+#
+# Tracking: dv-gascity-utils PR adding this script.
+
+set -euo pipefail
+
+DV_REPO_URL="https://github.com/DataViking-Tech/dv-gascity-utils"
+DV_REPO_PATH="$HOME/dv-gascity-utils"
+BIN_DIR="$HOME/.gc/bin"
+TOKEN_DIR="$HOME/.gc/tokens"
+GATEWAY_DIR="$HOME/.gc/gateway"
+LAUNCHD_DIR="$HOME/Library/LaunchAgents"
+
+DRY_RUN=0
+TS_IP=""
+HOST_NAME="$(hostname -s)"
+SKIP_HELPERS=0
+
+usage() {
+    cat <<'EOF'
+gc-city-bootstrap — host-local prep for a new Gas City deployment.
+
+Usage:
+  gc-city-bootstrap [options]
+
+Options:
+  --dry-run           Print what would happen; touch nothing.
+  --ts-ip=<addr>      Tailscale IP for the gateway to bind. Default:
+                      detected via `tailscale ip -4` if available.
+  --skip-helpers      Skip the run-once gc-fix-* invocation. Use when
+                      no city packs are installed yet.
+  -h, --help          Show this help.
+
+Examples:
+  gc-city-bootstrap                          # full bootstrap
+  gc-city-bootstrap --dry-run                # preview only
+  gc-city-bootstrap --ts-ip 100.99.0.42      # explicit Tailscale IP
+  gc-city-bootstrap --skip-helpers           # skip pack-tree patching
+
+After running, see docs/new-city-bootstrap.md for the manual steps.
+EOF
+}
+
+log() { printf '[gc-city-bootstrap] %s\n' "$*"; }
+warn() { printf '[gc-city-bootstrap] warn: %s\n' "$*" >&2; }
+die() { printf '[gc-city-bootstrap] error: %s\n' "$*" >&2; exit 1; }
+
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[gc-city-bootstrap] would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --skip-helpers) SKIP_HELPERS=1; shift ;;
+        --ts-ip=*) TS_IP="${1#--ts-ip=}"; shift ;;
+        --ts-ip)
+            shift
+            [ $# -gt 0 ] || die "--ts-ip requires an argument"
+            TS_IP="$1"; shift ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+# 1. Clone or fast-forward dv-gascity-utils.
+if [ ! -d "$DV_REPO_PATH/.git" ]; then
+    log "step 1/7: cloning $DV_REPO_URL → $DV_REPO_PATH"
+    run git clone "$DV_REPO_URL" "$DV_REPO_PATH"
+else
+    log "step 1/7: fast-forwarding $DV_REPO_PATH"
+    run git -C "$DV_REPO_PATH" fetch --quiet origin main
+    run git -C "$DV_REPO_PATH" merge --quiet --ff-only origin/main || \
+        warn "could not fast-forward (local changes?); using current state"
+fi
+
+# 2. Symlink helpers into ~/.gc/bin/.
+log "step 2/7: symlinking helpers into $BIN_DIR"
+run mkdir -p "$BIN_DIR"
+HELPERS=(
+    "gcx"
+    "gc-fix-merge-strategy"
+    "gc-fix-alias-mismatch"
+    "gc-audit-alias-mismatch"
+    "gc-fix-watch"
+    "gc-rig-join"
+    "gc-warm-rig-pool"
+    "gc-tune-refinery-loop"
+    "gc-fix-refinery-routing"
+    "gc-city-bootstrap"
+)
+for h in "${HELPERS[@]}"; do
+    src="$DV_REPO_PATH/packs/gascity-comms/assets/scripts/$h"
+    dst="$BIN_DIR/$h"
+    if [ -e "$src" ]; then
+        run ln -sf "$src" "$dst"
+    else
+        warn "missing helper source: $src (skipping symlink)"
+    fi
+done
+
+# 3. Generate gateway token if missing.
+log "step 3/7: ensuring gateway token at $TOKEN_DIR/$HOST_NAME-gateway.token"
+run mkdir -p "$TOKEN_DIR"
+run chmod 700 "$TOKEN_DIR"
+TOKEN_FILE="$TOKEN_DIR/$HOST_NAME-gateway.token"
+if [ ! -f "$TOKEN_FILE" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "would generate token: openssl rand -hex 32 > $TOKEN_FILE"
+    else
+        openssl rand -hex 32 > "$TOKEN_FILE"
+        chmod 600 "$TOKEN_FILE"
+        log "generated new gateway token (32 bytes hex). Distribute to peer hosts via secure channel."
+    fi
+else
+    log "token already exists at $TOKEN_FILE — leaving as-is"
+fi
+
+# 4. Caddyfile for the gateway.
+log "step 4/7: ensuring gateway Caddyfile at $GATEWAY_DIR/Caddyfile"
+run mkdir -p "$GATEWAY_DIR"
+
+if [ -z "$TS_IP" ]; then
+    if command -v tailscale >/dev/null 2>&1; then
+        TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+    fi
+fi
+
+if [ -z "$TS_IP" ]; then
+    warn "could not auto-detect Tailscale IP. Re-run with --ts-ip=<addr> to set."
+    warn "Skipping Caddyfile + gateway plist install. Helpers are still ready."
+else
+    log "using Tailscale IP: $TS_IP"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "would write $GATEWAY_DIR/Caddyfile with TS_IP=$TS_IP"
+    else
+        cat > "$GATEWAY_DIR/Caddyfile" <<EOF
+{
+    auto_https off
+    admin off
+    log {
+        output file $GATEWAY_DIR/access.log
+        format console
+    }
+}
+
+http://$TS_IP:8472 {
+    bind $TS_IP
+    @authorized header Authorization "Bearer {env.GC_GATEWAY_TOKEN}"
+
+    handle @authorized {
+        reverse_proxy 127.0.0.1:8372 {
+            header_up X-GC-Request 1
+            header_up -Authorization
+        }
+    }
+
+    handle {
+        respond "unauthorized" 401
+    }
+}
+EOF
+    fi
+fi
+
+# 5. LaunchAgent plists (macOS).
+if [ "$(uname -s)" = "Darwin" ]; then
+    log "step 5/7: ensuring LaunchAgent plists in $LAUNCHD_DIR"
+    run mkdir -p "$LAUNCHD_DIR"
+
+    # gc-fix-watch plist (always installable; no Tailscale dependency).
+    FIX_WATCH_TEMPLATE="$DV_REPO_PATH/packs/gascity-comms/assets/launchd/com.dv-gascity.fix-watch.plist.template"
+    FIX_WATCH_PLIST="$LAUNCHD_DIR/com.dv-gascity.fix-watch.plist"
+    if [ -f "$FIX_WATCH_TEMPLATE" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "would render $FIX_WATCH_TEMPLATE → $FIX_WATCH_PLIST"
+        else
+            sed "s|{{HOME}}|$HOME|g" "$FIX_WATCH_TEMPLATE" > "$FIX_WATCH_PLIST"
+        fi
+    else
+        warn "missing $FIX_WATCH_TEMPLATE — skipping fix-watch plist install"
+    fi
+
+    # Gateway plist requires GC_GATEWAY_TOKEN env injection. Template
+    # ships in dv-gascity-utils only if available; otherwise we leave a
+    # commented-out skeleton for the operator to finish manually.
+    GATEWAY_PLIST="$LAUNCHD_DIR/dev.gascity.gateway.plist"
+    if [ -n "$TS_IP" ] && [ ! -f "$GATEWAY_PLIST" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "would write $GATEWAY_PLIST"
+        else
+            cat > "$GATEWAY_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.gascity.gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>export GC_GATEWAY_TOKEN="\$(cat $TOKEN_FILE)" &amp;&amp; exec /opt/homebrew/bin/caddy run --config $GATEWAY_DIR/Caddyfile</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$GATEWAY_DIR/launchd.out.log</string>
+    <key>StandardErrorPath</key><string>$GATEWAY_DIR/launchd.err.log</string>
+    <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>
+EOF
+        fi
+    fi
+
+    # 6. Load LaunchAgents.
+    log "step 6/7: loading LaunchAgents"
+    if [ -f "$FIX_WATCH_PLIST" ]; then
+        run launchctl bootout "gui/$(id -u)/com.dv-gascity.fix-watch" 2>/dev/null || true
+        run launchctl bootstrap "gui/$(id -u)" "$FIX_WATCH_PLIST"
+    fi
+    if [ -f "$GATEWAY_PLIST" ]; then
+        run launchctl bootout "gui/$(id -u)/dev.gascity.gateway" 2>/dev/null || true
+        run launchctl bootstrap "gui/$(id -u)" "$GATEWAY_PLIST"
+    fi
+else
+    log "step 5/7 + 6/7: non-Darwin host detected. Use systemd unit"
+    log "  template at packs/gascity-comms/assets/systemd/gc-fix-watch.service.template"
+    log "  per docs/pack-template-resilience.md."
+fi
+
+# 7. Run gc-fix-* helpers once against discovered towns.
+if [ "$SKIP_HELPERS" -eq 1 ]; then
+    log "step 7/7: --skip-helpers requested; not running fix-* helpers"
+else
+    log "step 7/7: running gc-fix-* helpers against discovered towns"
+    TOWNS=()
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs" ] && TOWNS+=("$d")
+    done
+    if [ ${#TOWNS[@]} -eq 0 ]; then
+        log "no towns found under \$HOME/* with .gc/system/packs/. Run 'gc init <name>' first."
+    else
+        for town in "${TOWNS[@]}"; do
+            log "  scanning $town"
+            for fixer in "$BIN_DIR"/gc-fix-*; do
+                [ -x "$fixer" ] || continue
+                base="$(basename "$fixer")"
+                # Skip the watcher — that's a daemon, not a one-shot.
+                [ "$base" = "gc-fix-watch" ] && continue
+                # Skip the bootstrap itself.
+                [ "$base" = "gc-city-bootstrap" ] && continue
+                # Skip deprecated shim.
+                [ "$base" = "gc-fix-refinery-routing" ] && continue
+                run "$fixer" "$town"
+            done
+        done
+    fi
+fi
+
+log "done. See docs/new-city-bootstrap.md for manual follow-up steps:"
+log "  - Edit ~/.gc/peers.toml from the template."
+log "  - Distribute $TOKEN_FILE securely to peer hosts."
+log "  - Run 'gc init <city-name>' to initialize a city if not yet."
+log "  - Apply polecat min_active=0 overrides per docs/agent-scaling.md."
