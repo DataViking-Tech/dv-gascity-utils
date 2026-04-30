@@ -191,6 +191,52 @@ The metadata side-effect (`GC_RESTART_REQUESTED`) is no longer the contract anyo
 
 ---
 
+## events.jsonl endpoint hangs when log grows past ~400 MB
+
+**Trackers**: `yg-wisp-djc` (DOCTOR finding 2026-04-28 flagged size at 100 MB), `yg-wisp-dv4` (ESCALATION 2026-04-30 confirmed actual service hang at 426 MB).
+
+**Symptom**: `GET /v0/city/<name>/events` (and `?limit=1` variants) hangs indefinitely once `events.jsonl` grows past roughly 400 MB. Other endpoints (e.g. `/v0/health`) respond instantly. `gc events --watch` and `gc events --seq` fail with `context deadline exceeded`. Witnesses, refineries, and deacons that gate cycles on event-watch fall back to spin-cycles or self-restart loops.
+
+**Evidence (yg, 2026-04-30)**:
+- `events.jsonl` at 426 MB → 5+ second hangs on `/events?limit=1`
+- After `mv events.jsonl events.jsonl.archive.<ts> && touch events.jsonl`: same endpoint returns 200 in 0.86ms
+- No supervisor restart required — supervisor's writer continues appending to the new empty file transparently
+
+**Why this happens**: the endpoint appears to read the full file on each request. No streaming, no pagination short-circuit. Doubled from 100 MB → 426 MB in 36h on yg without rotation, suggesting no built-in retention policy.
+
+**Workaround (Class A — operational)**: archive + truncate when the file grows past a threshold. Verified safe on a live yg supervisor:
+
+```bash
+mv ~/<town>/.gc/events.jsonl ~/<town>/.gc/events.jsonl.archive.$(date -u +%Y-%m-%dT%H-%MZ)
+touch ~/<town>/.gc/events.jsonl
+chmod 644 ~/<town>/.gc/events.jsonl
+```
+
+**Workaround (Class A automated)**: `gc-events-rotate` helper. Hourly LaunchAgent (`com.dv-gascity.events-rotate`) checks every town's `events.jsonl`, rotates when over `--threshold-mb` (default 256), and prunes archives older than `--retain-days` (default 30).
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-events-rotate \
+    ~/.gc/bin/gc-events-rotate
+
+# One-shot
+gc-events-rotate --dry-run            # preview
+gc-events-rotate                      # apply
+gc-events-rotate --threshold-mb 512   # custom threshold
+
+# Install as hourly LaunchAgent (macOS):
+sed "s|{{HOME}}|$HOME|g" \
+    ~/dv-gascity-utils/packs/gascity-comms/assets/launchd/com.dv-gascity.events-rotate.plist.template \
+    > ~/Library/LaunchAgents/com.dv-gascity.events-rotate.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dv-gascity.events-rotate.plist
+tail -f ~/Library/Logs/gc-events-rotate.log
+```
+
+The archive files are preserved as historical record; prune by adjusting `--retain-days` or deleting manually. Re-installing on hosts after `gc-city-bootstrap` doesn't auto-install the events-rotate LaunchAgent — one more manual step in the bootstrap doc until decided otherwise.
+
+**Why no Class B**: this isn't a pack-template surface; it's runtime state in `<town>/.gc/`. Pack-watch wouldn't fire on events.jsonl growth. The hourly Periodic LaunchAgent is the right shape.
+
+---
+
 ## jsonl-export.sh column rename type → issue_type
 
 **Trackers**: `mg-yras` (closed — workaround applied).

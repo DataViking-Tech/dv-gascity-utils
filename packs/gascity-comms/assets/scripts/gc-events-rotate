@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# gc-events-rotate — archive events.jsonl when it exceeds a size threshold.
+#
+# WHY:
+#   The gc binary's `/v0/city/<name>/events` endpoint hangs indefinitely
+#   when events.jsonl grows past ~400 MB (observed on yggdrasil
+#   2026-04-30: 426 MB → 5+ second hangs blocking witness/refinery
+#   event-watch). The endpoint appears to read the full file on each
+#   request — no streaming, no pagination short-circuit. Archive +
+#   truncate clears the hang immediately without restarting the
+#   supervisor (the supervisor's writer either picks up the new file
+#   transparently or holds an fd; in observed testing, after rename +
+#   touch, new events flow into the empty file).
+#
+#   Filed as a Class C bug (mg-pending / no upstream tracker yet) — no
+#   binary fix planned per 2026-04-30 directive. This helper is the
+#   Class A/B workaround.
+#
+# WHAT it does:
+#   1. Checks every <town>/.gc/events.jsonl size against threshold (default
+#      256 MB).
+#   2. If over threshold: rename to events.jsonl.archive.<UTC-timestamp>
+#      then `touch` a fresh empty events.jsonl.
+#   3. Optionally prunes archives older than --retain-days (default 30).
+#
+# Idempotent: re-runs that find files under threshold are no-ops.
+#
+# Designed to be run from cron / launchd Periodic / or interactively:
+#   - Hourly check is reasonable (avoid breaching the threshold by much).
+#   - Won't conflict with gc-fix-watch (different file tree).
+
+set -euo pipefail
+
+THRESHOLD_MB=256
+RETAIN_DAYS=30
+DRY_RUN=0
+ROOTS=()
+
+usage() {
+    cat <<'EOF'
+gc-events-rotate — archive events.jsonl when it grows past a size threshold.
+
+Usage:
+  gc-events-rotate [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/events.jsonl that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --threshold-mb N    Rotate when events.jsonl exceeds N MB (default 256).
+  --retain-days N     Delete archives older than N days (default 30; 0 disables).
+  --dry-run           Report what would happen; touch nothing.
+  -h, --help          Show this help.
+
+Examples:
+  gc-events-rotate                          # default 256 MB threshold, every town
+  gc-events-rotate --threshold-mb 512       # rotate at 512 MB instead
+  gc-events-rotate --dry-run ~/yggdrasil    # preview one town
+  gc-events-rotate --retain-days 0 ~/asgard # disable archive pruning
+EOF
+}
+
+die() { echo "gc-events-rotate: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --threshold-mb)
+            shift
+            [ $# -gt 0 ] || die "--threshold-mb requires an argument"
+            THRESHOLD_MB="$1"; shift ;;
+        --threshold-mb=*) THRESHOLD_MB="${1#--threshold-mb=}"; shift ;;
+        --retain-days)
+            shift
+            [ $# -gt 0 ] || die "--retain-days requires an argument"
+            RETAIN_DAYS="$1"; shift ;;
+        --retain-days=*) RETAIN_DAYS="${1#--retain-days=}"; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+# Validate numeric inputs.
+case "$THRESHOLD_MB" in
+    ''|*[!0-9]*) die "--threshold-mb must be a non-negative integer" ;;
+esac
+case "$RETAIN_DAYS" in
+    ''|*[!0-9]*) die "--retain-days must be a non-negative integer" ;;
+esac
+
+THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -f "$d/.gc/events.jsonl" ] && ROOTS+=("$d")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || die "no .gc/events.jsonl found under $HOME/*; pass an explicit town root"
+fi
+
+# stat -f for macOS BSD, -c for GNU. Encapsulated for portability.
+file_size() {
+    local f="$1"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        stat -f '%z' "$f" 2>/dev/null || echo 0
+    else
+        stat -c '%s' "$f" 2>/dev/null || echo 0
+    fi
+}
+
+ts() { date -u "+%Y-%m-%dT%H-%MZ"; }
+
+rotated=0
+skipped=0
+pruned=0
+
+for town in "${ROOTS[@]}"; do
+    f="$town/.gc/events.jsonl"
+    if [ ! -f "$f" ]; then
+        echo "  skip: $town (no events.jsonl)"
+        continue
+    fi
+
+    size=$(file_size "$f")
+    size_mb=$((size / 1024 / 1024))
+
+    if [ "$size" -lt "$THRESHOLD_BYTES" ]; then
+        echo "  ok: $town/.gc/events.jsonl is ${size_mb}MB (under ${THRESHOLD_MB}MB threshold)"
+        skipped=$((skipped + 1))
+    else
+        archive="$f.archive.$(ts)"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would rotate: $f (${size_mb}MB) → $archive"
+        else
+            mv "$f" "$archive"
+            # Re-create with the original mode (default 644). The supervisor
+            # will append on its next event without needing to reopen.
+            touch "$f"
+            chmod 644 "$f"
+            echo "  rotated: $town/.gc/events.jsonl (${size_mb}MB) → $(basename "$archive")"
+        fi
+        rotated=$((rotated + 1))
+    fi
+
+    # Prune old archives if retain-days > 0.
+    if [ "$RETAIN_DAYS" -gt 0 ]; then
+        # find -mtime is in 24h units. -mtime +N matches files older than N days.
+        while IFS= read -r old; do
+            [ -n "$old" ] || continue
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "  would prune (older than ${RETAIN_DAYS}d): $(basename "$old")"
+            else
+                rm -f "$old"
+                echo "  pruned: $(basename "$old")"
+            fi
+            pruned=$((pruned + 1))
+        done < <(find "$town/.gc" -maxdepth 1 -name "events.jsonl.archive.*" -type f -mtime "+$RETAIN_DAYS" 2>/dev/null)
+    fi
+done
+
+echo
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'gc-events-rotate: %d would-rotate, %d skipped, %d would-prune (dry-run).\n' \
+        "$rotated" "$skipped" "$pruned"
+else
+    printf 'gc-events-rotate: %d rotated, %d skipped, %d pruned.\n' \
+        "$rotated" "$skipped" "$pruned"
+fi

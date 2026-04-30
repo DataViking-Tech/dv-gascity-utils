@@ -114,7 +114,9 @@ HELPERS=(
     "gc-fix-merge-strategy"
     "gc-fix-alias-mismatch"
     "gc-audit-alias-mismatch"
+    "gc-fix-runtime-restart"
     "gc-fix-watch"
+    "gc-events-rotate"
     "gc-rig-join"
     "gc-warm-rig-pool"
     "gc-tune-refinery-loop"
@@ -213,6 +215,19 @@ if [ "$(uname -s)" = "Darwin" ]; then
         warn "missing $FIX_WATCH_TEMPLATE — skipping fix-watch plist install"
     fi
 
+    # gc-events-rotate plist (hourly Periodic; no Tailscale dependency).
+    EVENTS_ROTATE_TEMPLATE="$DV_REPO_PATH/packs/gascity-comms/assets/launchd/com.dv-gascity.events-rotate.plist.template"
+    EVENTS_ROTATE_PLIST="$LAUNCHD_DIR/com.dv-gascity.events-rotate.plist"
+    if [ -f "$EVENTS_ROTATE_TEMPLATE" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "would render $EVENTS_ROTATE_TEMPLATE → $EVENTS_ROTATE_PLIST"
+        else
+            sed "s|{{HOME}}|$HOME|g" "$EVENTS_ROTATE_TEMPLATE" > "$EVENTS_ROTATE_PLIST"
+        fi
+    else
+        warn "missing $EVENTS_ROTATE_TEMPLATE — skipping events-rotate plist install"
+    fi
+
     # Gateway plist requires GC_GATEWAY_TOKEN env injection. Template
     # ships in dv-gascity-utils only if available; otherwise we leave a
     # commented-out skeleton for the operator to finish manually.
@@ -250,6 +265,10 @@ EOF
     if [ -f "$FIX_WATCH_PLIST" ]; then
         run launchctl bootout "gui/$(id -u)/com.dv-gascity.fix-watch" 2>/dev/null || true
         run launchctl bootstrap "gui/$(id -u)" "$FIX_WATCH_PLIST"
+    fi
+    if [ -f "$EVENTS_ROTATE_PLIST" ]; then
+        run launchctl bootout "gui/$(id -u)/com.dv-gascity.events-rotate" 2>/dev/null || true
+        run launchctl bootstrap "gui/$(id -u)" "$EVENTS_ROTATE_PLIST"
     fi
     if [ -f "$GATEWAY_PLIST" ]; then
         run launchctl bootout "gui/$(id -u)/dev.gascity.gateway" 2>/dev/null || true

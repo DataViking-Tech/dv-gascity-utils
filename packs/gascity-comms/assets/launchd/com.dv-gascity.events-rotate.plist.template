@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd Periodic template for gc-events-rotate (macOS).
+
+  Install:
+    1. Replace {{HOME}} with your absolute home path.
+    2. Copy to ~/Library/LaunchAgents/com.dv-gascity.events-rotate.plist
+    3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dv-gascity.events-rotate.plist
+    4. tail -f ~/Library/Logs/gc-events-rotate.log
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.dv-gascity.events-rotate
+    rm ~/Library/LaunchAgents/com.dv-gascity.events-rotate.plist
+
+  Cadence: hourly (StartInterval=3600). At 256 MB threshold, this lets
+  the file grow up to ~256 MB + 1h-of-events (~50 MB observed during
+  busy patrol cycles) before rotation. Tighten to 30min if events.jsonl
+  grows faster than expected on your host.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dv-gascity.events-rotate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{HOME}}/.gc/bin/gc-events-rotate</string>
+        <string>--threshold-mb</string>
+        <string>256</string>
+        <string>--retain-days</string>
+        <string>30</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/Library/Logs/gc-events-rotate.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/Library/Logs/gc-events-rotate.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}</string>
+</dict>
+</plist>
