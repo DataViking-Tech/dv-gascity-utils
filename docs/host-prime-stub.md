@@ -1,15 +1,22 @@
-# Per-Host Prime Stub Convention
+# Per-Host Prime: content guide
 
-> **Status:** convention only — no code change required. Each host that
-> imports `packs/gascity-comms` and opts into the cross-city prime
-> fragment writes its own short local stub describing host-specific
-> facts. The cross-city-prime fragment is generic; the local stub
-> carries everything the new mayor needs to know about THIS host that
-> it cannot derive from reading code.
+> **Status:** convention only — no code change required. Each host
+> that imports `packs/gascity-comms` and opts into the cross-city
+> prime adds a host-specific block of facts inlined into its
+> override mayor template. The cross-city-prime fragment is generic;
+> the inlined block carries everything the new mayor needs to know
+> about THIS host that it cannot derive from reading code.
 
-## What goes in the local stub
+> **Note:** earlier revisions of this doc described placing a
+> separate `prime.local.md` file at
+> `<rig-root>/<city>/agents/mayor/prime.local.md` and defining a
+> `local-prime` template. That mechanism doesn't work — see
+> `cross-city-prime-wiring-gap.md` for why. Inlining is the
+> documented path.
 
-The local stub answers four questions a freshly-restarted mayor would
+## What goes in the inlined block
+
+The block answers four questions a freshly-restarted mayor would
 otherwise have to re-discover:
 
 1. **Where am I on the tailnet?** Local Tailscale IP, gateway URL,
@@ -27,32 +34,20 @@ otherwise have to re-discover:
 Anything that depends on the specific host belongs here. Anything that
 applies to every host belongs in `cross-city-prime.template.md`.
 
-## Where to put the stub
+## Where the block goes
 
-By convention, each host stores its stub at:
+Inlined directly into the host's override mayor template, right after
+the `{{ template "cross-city-prime" . }}` call. See
+`mayor-prompt-prime-recipe.md` for the full override structure. The
+block is plain markdown, not a `{{ define ... }}` template:
 
-```
-<rig-root>/<city>/agents/mayor/prime.local.md
-```
+```markdown
+{{/* … upstream mayor prompt header … */}}
 
-For yggdrasil on this host that resolves to:
+{{ template "propulsion-mayor" . }}
 
-```
-~/yggdrasil/yggdrasil/agents/mayor/prime.local.md
-```
+{{ template "cross-city-prime" . }}
 
-Hosts running multiple cities (like `mani-mac-mini` running yggdrasil
-and asgard) write one stub per city. The stub is checked into the
-host's local pack repo, NOT into `dv-gascity-utils` — it contains
-host-specific facts and is by design unshared.
-
-## Stub structure
-
-The stub defines a `local-prime` template that the override mayor
-prompt invokes (see `docs/mayor-prompt-prime-recipe.md`):
-
-```gotemplate
-{{ define "local-prime" }}
 ### This Host: <city> on <hostname>
 
 - **Tailscale IP**: <ip>:8472 (gateway plist:
@@ -71,17 +66,23 @@ prompt invokes (see `docs/mayor-prompt-prime-recipe.md`):
 - <date> — <what was decided, in one line, and why it isn't
   derivable from git/bd>.
 - ...
-{{ end }}
+
+{{ template "capability-ledger-work" . }}
 ```
 
-Keep the stub under ~40 rendered lines. Anything longer means it
-should be a doc the prime points at, not a fact list inlined into
-every mayor turn.
+The override file lives at the host's chosen path and is loaded by gc
+without any `[[patches.agent]]` patch. Hosts running multiple cities
+(like `mani-mac-mini` running yggdrasil and asgard) write one
+override per city.
 
-## What NOT to put in the stub
+Keep the inlined block under ~40 rendered lines. Anything longer
+means it should be a doc the prime points at, not a fact list
+inlined into every mayor turn.
+
+## What NOT to put in the block
 
 - **Tokens or secrets.** `~/.gc/tokens/` paths are fine; the contents
-  are not. The stub gets rendered into every mayor's prompt.
+  are not. The block gets rendered into every mayor's prompt.
 - **Generic comms facts.** `gcx`, the gateway shape, the `mail-nudge`
   cadence — those live in `cross-city-prime.template.md`. If you
   catch yourself describing how `gcx` works, move it back upstream.
@@ -92,7 +93,7 @@ every mayor turn.
   taken on restart. Volatile facts (current bead under work, today's
   todo) belong in the assignment flow, not the prime.
 
-## When to update the stub
+## When to update the block
 
 When a durable fact about this host changes. Concretely:
 
@@ -103,28 +104,32 @@ When a durable fact about this host changes. Concretely:
   routing now uses `<rig>/gastown.refinery`").
 - The host's Tailscale IP changes (rare, but possible after reinstall).
 
-The stub is a per-host "if you forget everything else, this gets you
+The block is a per-host "if you forget everything else, this gets you
 oriented." Maintain it like a `CLAUDE.md` — small, accurate, dated
 when needed.
 
 ## Verification
 
-After writing or updating the stub, render the mayor prompt and grep
-for the section header:
+After writing or updating the override, render the mayor prompt and
+grep for the section header:
 
 ```bash
-gc agent prompt mayor 2>&1 | grep -A 5 "This Host:"
+gc prime mayor 2>&1 | grep -A 5 "This Host:"
 ```
 
-If you don't see it, the override template isn't invoking
-`{{ template "local-prime" . }}` — check
-`docs/mayor-prompt-prime-recipe.md` for the wiring.
+If you don't see it, the override template isn't in place — re-check
+the path under `<rig-root>/agents/mayor/prompt.template.md` and
+re-run `gc reload`. The doctor check from `dv-gascity-utils#16`
+formalizes this into an exit-code check.
 
 ## See also
 
 - `packs/gascity-comms/template-fragments/cross-city-prime.template.md`
-  — the city-agnostic prime this stub completes.
+  — the city-agnostic prime this block completes.
 - `docs/mayor-prompt-prime-recipe.md` — how to wire the host's
-  override mayor prompt template to invoke both fragments.
+  override mayor prompt template (no `[[patches.agent]]` block).
+- `docs/cross-city-prime-wiring-gap.md` — why the inline pattern is
+  the supported path and why the obvious-looking
+  `{{ template "local-prime" }}` indirection doesn't work.
 - `docs/cross-city-comms.md` — full architecture; the
   cross-city-prime is a summary, this is the long form.
