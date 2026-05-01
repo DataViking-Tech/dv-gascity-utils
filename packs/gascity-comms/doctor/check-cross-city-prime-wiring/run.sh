@@ -69,24 +69,25 @@ will come up without knowledge of gcx, peers.toml, the Tailscale gateway,
 or the X-Gascity-Origin convention — and have been observed to bypass
 the entire stack via direct dolt INSERTs into peer wisps tables.
 
-Fix (per docs/mayor-prompt-prime-recipe.md):
+Fix (per docs/mayor-prompt-prime-recipe.md and
+docs/cross-city-prime-wiring-gap.md):
 
-  1. Write a host-local mayor template override that includes both
-     fragments. Place at:
+  1. Write a host-local mayor template override at:
        <city-root>/agents/mayor/prompt.template.md
      Copy from:
        <city-root>/.gc/system/packs/gastown/agents/mayor/prompt.template.md
-     Insert two lines after {{ template "propulsion-mayor" . }}:
+     After {{ template "propulsion-mayor" . }}, insert:
        {{ template "cross-city-prime" . }}
-       {{ template "local-prime" . }}
+     Then INLINE this host's facts directly at the same insertion
+     point (Tailscale IP, peers from ~/.gc/peers.toml, active rigs,
+     recent local decisions). Do NOT use a separate prime.local.md
+     with {{ template "local-prime" . }} — the indirection looks
+     correct but the host-local fragment location isn't scanned by
+     gc's template loader. Inline content in the override file is
+     the supported path. See docs/host-prime-stub.md for the
+     content guide (4 questions to answer).
 
-  2. Write the host-specific local-prime stub at:
-       <city-root>/agents/mayor/prime.local.md
-     Defining "local-prime" with this host's Tailscale IP, peers,
-     active rigs, and recent local decisions. See
-     docs/host-prime-stub.md for the full content guide.
-
-  3. Run `gc reload` (or `gc supervisor reload` if the city
+  2. Run `gc reload` (or `gc supervisor reload` if the city
      controller is busy).
 
 Re-run `gc doctor` after to verify.
