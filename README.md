@@ -70,8 +70,8 @@ Per-host symlinks the bootstrap script handles automatically:
 
 ```bash
 for h in gcx gc-rig-join gc-audit-alias-mismatch gc-fix-alias-mismatch \
-         gc-fix-refinery-routing gc-fix-merge-strategy gc-fix-watch \
-         gc-warm-rig-pool gc-tune-refinery-loop gc-city-bootstrap; do
+         gc-fix-refinery-routing gc-fix-merge-strategy gc-fix-refinery-pr-body \
+         gc-fix-watch gc-warm-rig-pool gc-tune-refinery-loop gc-city-bootstrap; do
     ln -sf "$HOME/dv-gascity-utils/packs/gascity-comms/assets/scripts/$h" "$HOME/.gc/bin/$h"
 done
 cp ~/dv-gascity-utils/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
@@ -86,9 +86,10 @@ fixes:
 ```bash
 gc-fix-alias-mismatch ~/<town>     # or just `gc-fix-alias-mismatch` to scan ~/*
 gc-fix-merge-strategy ~/<town>
+gc-fix-refinery-pr-body ~/<town>
 ```
 
-Both are idempotent — re-runs report `already fixed`. See
+All three are idempotent — re-runs report `already fixed`. See
 `docs/alias-canonicalization.md` and `docs/rig-merge-strategy.md` for
 what each one rewrites and why.
 

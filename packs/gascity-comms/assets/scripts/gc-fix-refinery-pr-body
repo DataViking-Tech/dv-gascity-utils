@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# gc-fix-refinery-pr-body — make refinery `mr` PRs include `Closes #N`,
+# the GitHub issue link, work bead ID, commit log, blockquoted issue
+# context, and a test-plan checklist.
+#
+# Without this fix, the refinery's `mr`-strategy `PR_BODY` heredoc is a
+# 3-line stub:
+#
+#   ## Summary
+#   Automated pull request published by Gastown Refinery.
+#   - Issue: $WORK
+#   - Branch: $BRANCH
+#   - Target: $TARGET
+#
+# Reviewers have to leave the PR to find the original GitHub issue, and
+# the bead's `external_ref` (already populated by the mayor when
+# creating beads from GitHub issues, e.g. `--external-ref gh-343`) is
+# thrown away. This helper patches the heredoc to derive a `Closes #N`
+# closing keyword and a clickable issue URL from `external_ref`, plus
+# the commit log and the bead description as blockquoted context.
+#
+# This helper patches the refinery formula in every gastown system pack
+# found on this host. Each town's `.gc/system/packs/gastown/` is a
+# runtime copy that is not in any git repo, so the only authoritative
+# way to apply the fix locally is in-place (same pattern as
+# gc-fix-merge-strategy and gc-fix-refinery-routing).
+#
+# Files touched per pack (skipped silently if absent):
+#   formulas/mol-refinery-patrol.toml
+#
+# Idempotent: rewrite is guarded by a marker check (looks for
+# `EXTERNAL_REF=` in the merge-push step). Fixed packs report
+# "already fixed".
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-refinery-pr-body — enrich the refinery's mr-strategy PR body.
+
+Usage:
+  gc-fix-refinery-pr-body [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/gastown that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-fix-refinery-pr-body                       # scan ~/* and patch every gastown pack
+  gc-fix-refinery-pr-body --dry-run             # preview without writing
+  gc-fix-refinery-pr-body ~/yggdrasil ~/asgard  # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-fix-refinery-pr-body: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs/gastown" ] && ROOTS+=("$d")
+    done
+fi
+
+[ ${#ROOTS[@]} -gt 0 ] || die "no gastown system packs found under $HOME/*; pass explicit roots"
+
+# patch_with_python <file> <python-script>
+patch_with_python() {
+    local file="$1" script="$2"
+    if [ ! -f "$file" ]; then
+        echo "    skip (missing): ${file#$HOME/}"
+        return
+    fi
+    local tmp; tmp=$(mktemp)
+    if ! python3 -c "$script" <"$file" >"$tmp"; then
+        rm -f "$tmp"
+        die "python patch failed on $file"
+    fi
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        echo "    ok (already fixed): ${file#$HOME/}"
+        return
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        rm -f "$tmp"
+        echo "    would edit: ${file#$HOME/}"
+        return
+    fi
+    mv "$tmp" "$file"
+    echo "    fixed: ${file#$HOME/}"
+}
+
+# Patch script for formulas/mol-refinery-patrol.toml.
+# Replaces the literal stub PR_BODY heredoc in the merge-push step
+# (under `**If MERGE_STRATEGY = "mr":**`) with an enriched variant
+# that pulls external_ref, bead description, commit log, and renders
+# `Closes #N` + GitHub issue URL when external_ref matches `gh-N`.
+read -r -d '' FORMULA_PATCH <<'PYEOF' || true
+import sys, re
+
+src = sys.stdin.read()
+
+# Marker: the patched version assigns EXTERNAL_REF in the merge-push
+# step. If that variable is set anywhere in the file, treat as
+# already patched.
+if re.search(r'^EXTERNAL_REF=', src, re.MULTILINE):
+    sys.stdout.write(src)
+    sys.exit(0)
+
+# Match the literal stub block. Anchored on the EXISTING_PR line that
+# starts the section, through the closing EOF + ) of the heredoc.
+old = '''EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
+ISSUE_TITLE=$(gc bd show $WORK --json | jq -r '.[0].title')
+PR_BODY=$(cat <<EOF
+## Summary
+
+Automated pull request published by Gastown Refinery.
+
+- Issue: $WORK
+- Branch: $BRANCH
+- Target: $TARGET
+
+EOF
+)'''
+
+new = '''EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
+ISSUE_TITLE=$(gc bd show $WORK --json | jq -r '.[0].title')
+EXTERNAL_REF=$(gc bd show $WORK --json | jq -r '.[0].external_ref // empty')
+BEAD_DESC=$(gc bd show $WORK --json | jq -r '.[0].description // ""' | sed 's/^/> /' | head -60)
+COMMIT_LOG=$(git log --oneline "origin/$TARGET..$BRANCH" 2>/dev/null | head -15)
+GH_ISSUE_LINK=""
+GH_ISSUE_REF=""
+if echo "$EXTERNAL_REF" | grep -qE '^gh-[0-9]+$'; then
+  GH_ISSUE_NUM="${EXTERNAL_REF#gh-}"
+  GH_ISSUE_LINK="https://github.com/$ORIGIN_REPO/issues/$GH_ISSUE_NUM"
+  GH_ISSUE_REF="Closes #$GH_ISSUE_NUM"
+fi
+PR_BODY=$(cat <<EOF
+## Summary
+
+Automated pull request published by Gastown Refinery for work bead \\`$WORK\\`.
+
+${GH_ISSUE_REF:+$GH_ISSUE_REF}
+${GH_ISSUE_LINK:+- **GitHub issue:** $GH_ISSUE_LINK}
+${EXTERNAL_REF:+- **External ref:** \\`$EXTERNAL_REF\\`}
+- **Work bead:** \\`$WORK\\`
+- **Branch:** \\`$BRANCH\\` → \\`$TARGET\\`
+
+## Changes
+
+\\`\\`\\`
+$COMMIT_LOG
+\\`\\`\\`
+
+## Issue context
+
+$BEAD_DESC
+
+## Test plan
+
+- [ ] CI checks pass on this PR
+- [ ] Acceptance criteria from the linked issue verified
+- [ ] No regressions in adjacent surfaces
+
+---
+Published by Gastown Refinery (rig: \\`${GC_RIG:-unknown}\\`).
+EOF
+)'''
+
+if old not in src:
+    sys.stderr.write(
+        "gc-fix-refinery-pr-body: the literal stub PR_BODY block was not found in "
+        "the input file. The upstream formula may have shifted shape — re-check the "
+        "patch heredoc against the current `**If MERGE_STRATEGY = \"mr\":**` section "
+        "of mol-refinery-patrol.toml and update the `old` string in this helper.\n"
+    )
+    sys.exit(2)
+
+sys.stdout.write(src.replace(old, new, 1))
+PYEOF
+
+echo "Scanning ${#ROOTS[@]} root(s):"
+printf '  %s\n' "${ROOTS[@]}"
+echo
+
+for root in "${ROOTS[@]}"; do
+    pack="$root/.gc/system/packs/gastown"
+    [ -d "$pack" ] || { echo "  skip (no gastown pack): ${root#$HOME/}"; continue; }
+    echo "  ${pack#$HOME/}:"
+    patch_with_python "$pack/formulas/mol-refinery-patrol.toml" "$FORMULA_PATCH"
+done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo
+    echo "dry-run complete; no files were changed"
+else
+    echo
+    echo "done. Re-run safely; subsequent runs report 'already fixed'."
+fi
