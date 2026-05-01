@@ -3,10 +3,17 @@
 > **Status:** opt-in, per host. The upstream gastown mayor prompt
 > template is shared across cities and is NOT modified. Hosts that
 > want freshly-restarted mayors to come up oriented to the cross-city
-> setup override the mayor prompt locally and pull in two fragments:
-> the city-agnostic `cross-city-prime` from `packs/gascity-comms`,
-> and a per-host `local-prime` written by the host (see
-> `docs/host-prime-stub.md`).
+> setup override the mayor prompt locally, invoke the
+> `cross-city-prime` fragment from `packs/gascity-comms`, and inline
+> a short host-specific block of facts directly in the override.
+
+> **Note on shape:** earlier revisions of this recipe described a
+> four-step sequence with a separate `local-prime.template.md` file
+> wired in via `[[patches.agent]]` + `inject_fragments_append`. That
+> sequence doesn't complete on current gc binaries — see
+> `cross-city-prime-wiring-gap.md` for the why. The recipe below is
+> the working three-step shape (import, write override, reload).
+> No `[[patches.agent]]` block is required.
 
 ## What this recipe does
 
@@ -38,19 +45,19 @@ dv-gascity-utils            (shared, this repo)
       └── template-fragments/
           └── cross-city-prime.template.md     ← city-agnostic prime
 
-<host-local pack>           (per host, NOT shared)
-  ├── agents/mayor/prompt.template.md          ← override that
-  │                                              invokes both
-  │                                              cross-city-prime
-  │                                              AND local-prime
-  └── template-fragments/
-      └── local-prime.template.md              ← host-specific stub
+<host-rig-root>             (per host, NOT shared)
+  └── agents/mayor/prompt.template.md          ← override that
+                                                 invokes
+                                                 cross-city-prime
+                                                 AND inlines host
+                                                 facts directly
 ```
 
-The override template is a copy of the upstream mayor prompt with two
-extra `{{ template ... }}` calls inserted. It lives in the host's
-local pack — anything in this repo or the upstream gastown pack
-remains unmodified.
+The override template is a copy of the upstream mayor prompt with
+one extra `{{ template ... }}` call (cross-city-prime) and a short
+markdown block (host facts) inserted near the top. It lives in the
+host's local pack — anything in this repo or the upstream gastown
+pack remains unmodified.
 
 ## Step 1: import the gascity-comms pack
 
@@ -61,25 +68,43 @@ In the host's local `pack.toml`:
   source = "/absolute/path/to/dv-gascity-utils/packs/gascity-comms"
 ```
 
-Then `gc reload`. This makes the `cross-city-prime` define visible.
+Then `gc reload`. This makes the `cross-city-prime` define visible to
+the template loader.
 
-## Step 2: write the local-prime fragment
+For development hosts, point `source` directly at the dv-gascity-utils
+working tree (`source = "/Users/<you>/dv-gascity-utils/packs/gascity-comms"`)
+so pack refresh is `git pull`. For production hosts, vendor a copy
+and refresh on a cadence. yg and mg both use the source-pointed
+pattern as of 2026-05-01.
 
-Create the host-specific stub at the path agreed in
-`docs/host-prime-stub.md`. For a host with one city `<city>` running
-out of `<rig-root>`, place it at:
+## Step 2: write the override mayor template with host facts inlined
+
+Save the override at:
 
 ```
-<rig-root>/<city>/agents/mayor/prime.local.md
+<rig-root>/agents/mayor/prompt.template.md
 ```
 
-Contents (filled with concrete host facts):
+Start with a verbatim copy of the upstream gastown mayor prompt. Add
+two pieces:
+
+1. A `{{ template "cross-city-prime" . }}` call right after the
+   propulsion-mayor section.
+2. A short "This Host: …" markdown block right after that, with the
+   four-question content guide from `host-prime-stub.md` filled in
+   concretely (Tailscale IP, peers, rigs, recent decisions).
 
 ```gotemplate
-{{ define "local-prime" }}
+{{/* … upstream mayor prompt header … */}}
+
+{{ template "propulsion-mayor" . }}
+
+{{ template "cross-city-prime" . }}
+
 ### This Host: <city> on <hostname>
 
-- **Tailscale IP**: <ip>:8472.
+- **Tailscale IP**: <ip>:8472 (gateway plist:
+  `dev.gascity.gateway`).
 - **Peers in `~/.gc/peers.toml`**:
   - `<peer-city>` — `http://<peer-ip>:8472`
     (token: `~/.gc/tokens/<peer>-gateway.token`)
@@ -89,73 +114,36 @@ Contents (filled with concrete host facts):
 ### Recent local decisions
 
 - <date> — <one-line note>.
-{{ end }}
-```
-
-See `docs/host-prime-stub.md` for the full content guide and what NOT
-to put here.
-
-## Step 3: copy the upstream mayor prompt and add the prime calls
-
-The override template is a verbatim copy of the upstream gastown
-mayor prompt with two `{{ template ... }}` lines inserted. A sensible
-spot is right after `{{ template "propulsion-mayor" . }}` and before
-`{{ template "capability-ledger-work" . }}`, but anywhere is fine
-provided it runs once per turn.
-
-```gotemplate
-{{/* … upstream mayor prompt header … */}}
-
-{{ template "propulsion-mayor" . }}
-
-{{ template "cross-city-prime" . }}
-{{ template "local-prime" . }}
 
 {{ template "capability-ledger-work" . }}
 
 {{/* … rest of upstream mayor prompt … */}}
 ```
 
-Save this at a path inside the host's local pack, e.g.:
+There is no separate `prime.local.md` file, no `{{ define
+"local-prime" }}` block, no `[[patches.agent]]` patch. The override
+is a single file the loader picks up automatically from the
+conventional path.
 
-```
-<host-pack-root>/agents/mayor/prompt.template.md
-```
+See `host-prime-stub.md` for the full content guide and what NOT to
+put in the inlined block.
 
-## Step 4: patch the agent definition to use the override
-
-In the host's local `pack.toml`, add a single `[[patches.agent]]`
-block that points the mayor's `prompt_template` at the override and
-also injects the two fragment files via
-`inject_fragments_append` so they're loaded into the template
-namespace:
-
-```toml
-[[patches.agent]]
-  name = "mayor"
-  prompt_template = "agents/mayor/prompt.template.md"
-  inject_fragments_append = [
-    "/absolute/path/to/dv-gascity-utils/packs/gascity-comms/template-fragments/cross-city-prime.template.md",
-    "/absolute/path/to/<host-rig-root>/<city>/agents/mayor/prime.local.md",
-  ]
-```
-
-`prompt_template` is resolved relative to the patching pack's root.
-`inject_fragments_append` takes absolute paths today — see the
-discussion in `docs/collaborative-loops.md` (Opting in) for the
-caveats around relative-path resolution on different gc versions.
-
-## Step 5: reload and verify
+## Step 3: reload and verify
 
 ```bash
 gc reload
-gc agent prompt mayor 2>&1 | grep -A 2 "Cross-City Operational Prime"
-gc agent prompt mayor 2>&1 | grep -A 2 "This Host:"
+gc prime mayor 2>&1 | grep -iE 'cross-city|peers|gateway|gcx|tailscale' | head -3
+gc prime mayor 2>&1 | grep -A 5 'This Host:'
 ```
 
-If both blocks appear, the override is wired. If you see
-`gc: inject_fragment %q: template not found`, one of the fragment
-paths didn't resolve — re-check the absolute paths.
+The first grep should show hits — `cross-city-prime` is rendering.
+The second should show the inlined "This Host" block. If neither
+matches, gascity-comms isn't on the import list (re-check
+`pack.toml`). If only the first matches, the override isn't being
+loaded — verify the path under `<rig-root>/agents/mayor/`.
+
+The doctor check shipped in `dv-gascity-utils#16` formalizes this
+into an exit-code check. Adopt it once merged.
 
 ## Trade-offs
 
@@ -175,8 +163,8 @@ paths didn't resolve — re-check the absolute paths.
   this is a few percent of context budget.
 - The override template is a fork of the upstream gastown mayor
   prompt. When upstream changes, you re-merge. Keep the override
-  minimal (just the two `{{ template ... }}` calls inserted into a
-  vanilla copy) so re-merges are mechanical.
+  minimal (just the `{{ template "cross-city-prime" . }}` call and
+  the inlined host block) so re-merges are mechanical.
 - Per-host opt-in means each host has to do this once. There is no
   "ship the prime everywhere automatically" path — that's a feature,
   because the host-specific facts genuinely differ per host.
@@ -195,9 +183,11 @@ paths didn't resolve — re-check the absolute paths.
 
 - `packs/gascity-comms/template-fragments/cross-city-prime.template.md`
   — the fragment.
-- `docs/host-prime-stub.md` — what goes in `local-prime`.
+- `docs/host-prime-stub.md` — content guide for the inlined "This
+  Host" block.
+- `docs/cross-city-prime-wiring-gap.md` — why this recipe is the
+  inline pattern instead of the older four-step shape.
 - `docs/cross-city-comms.md` — full architecture (the fragment is a
   summary of this).
-- `docs/collaborative-loops.md` — sibling fragment with the same
-  opt-in pattern; its "Opting in" section discusses the
-  `inject_fragments_append` caveats in more depth.
+- `docs/collaborative-loops.md` — sibling cross-city template
+  fragment with the same opt-in pattern.
