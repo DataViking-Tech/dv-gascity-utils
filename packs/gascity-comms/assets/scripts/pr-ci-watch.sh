@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# pr-ci-watch.sh — watch open PRs linked to tracked beads and resling on
-# CI failure. Runs from a cooldown order every ~5 min.
+# pr-ci-watch.sh — watch open PRs linked to tracked beads, auto-merge on
+# green CI, and resling on failure paths. Runs from a cooldown order
+# every ~5 min.
 #
 # Two bead populations are tracked:
 #
@@ -14,31 +15,49 @@
 #
 # Per bead, the script:
 #   - Resolves PR URL (from metadata or by branch lookup)
-#   - Reads PR state and check rollup
+#   - Reads PR state, mergeable status, and check rollup
 #   - Acts:
-#       PR merged   -> set merge_result=merged_external + merged_sha
-#       PR closed   -> set merge_result=closed_without_merge
-#       CI all-pass -> set ci_status=passed (no auto-merge)
-#       CI any-fail -> resling: reopen, set rejection_reason +
-#                      existing_pr + last_ci_failure, route to
-#                      <rig>/gastown.polecat, increment resling_count
-#       CI pending  -> no-op this cycle
+#       PR merged       -> set merge_result=merged_external + merged_sha
+#       PR closed       -> set merge_result=closed_without_merge
+#       CI any-fail     -> resling
+#       CI pending      -> no-op this cycle
+#       MERGEABLE=CONFLICTING -> resling (merge conflict on target)
+#       CI all-pass + mergeable -> attempt `gh pr merge --squash --delete-branch`
+#         success      -> set merge_result=merged_external on next cycle
+#                          via the MERGED state branch
+#         failure      -> resling (treated as a merge conflict surfaced
+#                          at merge time)
+#
+# Resling shape (single path, called from any of the failure branches
+# above):
+#   - reopen bead (status=open)
+#   - clear assignee so the polecat pool reconciler picks it up
+#   - set gc.routed_to=<rig>/gastown.polecat
+#   - set rejection_reason describing what failed
+#   - set existing_pr=<pr_url> so the polecat reuses the same PR
+#   - set last_ci_failure timestamp
+#   - increment resling_count
+#   - clear terminal markers (merge_result, blocked_reason)
 #
 # Resling cap: when metadata.resling_count >= MAX_RESLINGS, escalate to
 # mayor via mail and stop reslinging. Default 3. Override via env var
 # PR_CI_WATCH_MAX_RESLINGS.
 #
+# Auto-merge: enabled by default. To opt out (preserve the older
+# "humans merge" policy on a host-by-host basis), set
+# PR_CI_WATCH_AUTO_MERGE=false in the order's environment. With
+# auto-merge disabled, CI green still records ci_status=passed and the
+# script returns without acting (existing pre-2026-05-01 behavior).
+#
 # Idempotent. Terminal merge_result values are skipped. Each cycle is a
 # self-contained pass.
-#
-# Constraint (from the bead's design): never auto-merge on green CI.
-# Branch protection is the policy for human-facing repos.
 #
 # Runs as an exec order — no agent, no LLM, no wisp.
 
 set -euo pipefail
 
 MAX_RESLINGS="${PR_CI_WATCH_MAX_RESLINGS:-3}"
+AUTO_MERGE="${PR_CI_WATCH_AUTO_MERGE:-true}"
 
 if ! command -v gh >/dev/null 2>&1; then
     exit 0
@@ -153,10 +172,11 @@ discover_pr_url() {
     printf '%s' "$res" | jq -r '.[0].url // empty'
 }
 
-# pr_info <pr_url> -> stdout: JSON {state, mergedAt, mergeCommit, closed}
+# pr_info <pr_url> -> stdout: JSON {state, mergedAt, mergeCommit, closed, mergeable}
+# mergeable values returned by gh: MERGEABLE | CONFLICTING | UNKNOWN
 pr_info() {
     local pr_url="$1"
-    gh pr view "$pr_url" --json state,mergedAt,mergeCommit,closed 2>/dev/null || echo "{}"
+    gh pr view "$pr_url" --json state,mergedAt,mergeCommit,closed,mergeable 2>/dev/null || echo "{}"
 }
 
 # checks_summary <pr_url> -> stdout: pass | fail | pending | none | error
@@ -195,6 +215,67 @@ failing_checks_brief() {
         2>/dev/null || true
 }
 
+# resling_bead <bead_id> <rig> <pr_url> <reason> <resling_count>
+# Reopens the bead, routes to the polecat pool with rejection metadata,
+# preserves existing_pr so the polecat resumes against the same PR.
+# Caller is responsible for the MAX_RESLINGS cap check; this function
+# performs the resling unconditionally.
+resling_bead() {
+    local bead_id="$1" rig="$2" pr_url="$3" reason="$4" resling_count="$5"
+    local new_count=$((resling_count + 1))
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    bd update "$bead_id" \
+        --status=open \
+        --assignee="" \
+        --set-metadata "gc.routed_to=$rig/gastown.polecat" \
+        --set-metadata "rejection_reason=$reason" \
+        --set-metadata "existing_pr=$pr_url" \
+        --set-metadata "last_ci_failure=$now" \
+        --set-metadata "resling_count=$new_count" \
+        --unset-metadata merge_result \
+        --unset-metadata blocked_reason \
+        --append-notes "pr-ci-watch: $reason; reslinging to $rig/gastown.polecat pool (attempt $new_count/$MAX_RESLINGS)." \
+        >/dev/null 2>&1 || true
+}
+
+# escalate_cap_reached <bead_id> <pr_url> <resling_count>
+# Mails mayor and marks bead with ci_status=failed_max_reslings.
+escalate_cap_reached() {
+    local bead_id="$1" pr_url="$2" resling_count="$3"
+    bd update "$bead_id" \
+        --set-metadata ci_status=failed_max_reslings \
+        --append-notes "pr-ci-watch: failed after $resling_count resling(s); cap reached, escalating." \
+        >/dev/null 2>&1 || true
+    gc mail send mayor/ \
+        -s "ESCALATION: PR-CI resling cap reached for $bead_id [HIGH]" \
+        -m "Bead: $bead_id
+PR: $pr_url
+Resling count: $resling_count (cap: $MAX_RESLINGS)
+Action: human review needed; watcher has stopped reslinging this bead." \
+        >/dev/null 2>&1 || true
+}
+
+# attempt_auto_merge <pr_url> -> stdout: "ok" | "conflict" | "skipped"
+# Tries `gh pr merge --squash --delete-branch`. Returns "skipped" if
+# auto-merge is disabled. Returns "conflict" on any failure (most
+# commonly the source-branch merge conflict surfaced at merge time, but
+# the script treats any merge failure as a resling trigger so the
+# polecat re-investigates).
+attempt_auto_merge() {
+    local pr_url="$1"
+    if [[ "$AUTO_MERGE" != "true" ]]; then
+        printf 'skipped'
+        return
+    fi
+    if gh pr merge "$pr_url" --squash --delete-branch >/dev/null 2>&1; then
+        printf 'ok'
+    else
+        printf 'conflict'
+    fi
+}
+
 # process_bead <bead_json>
 process_bead() {
     local bead_json="$1"
@@ -221,12 +302,13 @@ process_bead() {
         bd update "$bead_id" --set-metadata pr_url="$pr_url" >/dev/null 2>&1 || true
     fi
 
-    local info state merged_at merge_sha
+    local info state merged_at merge_sha mergeable
     info=$(pr_info "$pr_url")
     [[ -z "$info" || "$info" == "{}" ]] && return 0
     state=$(printf '%s' "$info" | jq -r '.state // empty')
     merged_at=$(printf '%s' "$info" | jq -r '.mergedAt // empty')
     merge_sha=$(printf '%s' "$info" | jq -r '.mergeCommit.oid // empty')
+    mergeable=$(printf '%s' "$info" | jq -r '.mergeable // empty')
 
     case "$state" in
         MERGED)
@@ -252,12 +334,59 @@ process_bead() {
             ;;
     esac
 
+    # Merge-conflict short-circuit: if GitHub already reports the PR as
+    # CONFLICTING against its base, no point in waiting for CI to finish
+    # — resling so the polecat rebases and resolves. This catches the
+    # common case where main moved under a long-lived PR.
+    if [[ "$mergeable" == "CONFLICTING" ]]; then
+        if [[ "$resling_count" -ge "$MAX_RESLINGS" ]]; then
+            escalate_cap_reached "$bead_id" "$pr_url" "$resling_count"
+            return 0
+        fi
+        resling_bead "$bead_id" "$rig" "$pr_url" \
+            "Merge conflict on target (mergeable=CONFLICTING)" \
+            "$resling_count"
+        return 0
+    fi
+
     local ci
     ci=$(checks_summary "$pr_url")
     case "$ci" in
         pass)
             bd update "$bead_id" --set-metadata ci_status=passed >/dev/null 2>&1 || true
-            return 0
+            # Auto-merge attempt. With AUTO_MERGE=false this is a no-op
+            # and the script returns leaving the PR for human merge —
+            # preserving the pre-2026-05-01 default behavior.
+            local merge_result
+            merge_result=$(attempt_auto_merge "$pr_url")
+            case "$merge_result" in
+                ok)
+                    # Next cycle's MERGED-state branch records merge_result/merged_sha.
+                    bd update "$bead_id" \
+                        --append-notes "pr-ci-watch: CI green; auto-merged via gh pr merge --squash --delete-branch." \
+                        >/dev/null 2>&1 || true
+                    return 0
+                    ;;
+                conflict)
+                    # Auto-merge failed despite mergeable!=CONFLICTING — most
+                    # likely a transient race (target moved between pr_info
+                    # and the merge call) or a branch-protection rule the
+                    # script can't satisfy (required reviewers, signed
+                    # commits, etc.). Treat as a merge-conflict resling so
+                    # the polecat re-investigates rather than spinning.
+                    if [[ "$resling_count" -ge "$MAX_RESLINGS" ]]; then
+                        escalate_cap_reached "$bead_id" "$pr_url" "$resling_count"
+                        return 0
+                    fi
+                    resling_bead "$bead_id" "$rig" "$pr_url" \
+                        "Merge conflict at auto-merge time (gh pr merge --squash failed despite green CI)" \
+                        "$resling_count"
+                    return 0
+                    ;;
+                skipped)
+                    return 0
+                    ;;
+            esac
             ;;
         none)
             bd update "$bead_id" --set-metadata ci_status=no_checks >/dev/null 2>&1 || true
@@ -273,47 +402,16 @@ process_bead() {
             ;;
     esac
 
+    # CI fail path.
     if [[ "$resling_count" -ge "$MAX_RESLINGS" ]]; then
-        bd update "$bead_id" \
-            --set-metadata ci_status=failed_max_reslings \
-            --append-notes "pr-ci-watch: CI failed after $resling_count resling(s); cap reached, escalating." \
-            >/dev/null 2>&1 || true
-        gc mail send mayor/ \
-            -s "ESCALATION: PR-CI resling cap reached for $bead_id [HIGH]" \
-            -m "Bead: $bead_id
-PR: $pr_url
-Resling count: $resling_count (cap: $MAX_RESLINGS)
-Action: human review needed; watcher has stopped reslinging this bead." \
-            >/dev/null 2>&1 || true
+        escalate_cap_reached "$bead_id" "$pr_url" "$resling_count"
         return 0
     fi
 
     local fails
     fails=$(failing_checks_brief "$pr_url")
     [[ -z "$fails" ]] && fails="unknown"
-    local new_count=$((resling_count + 1))
-    local now
-    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    # Unassign so the bead lands in the polecat pool. The reconciler
-    # finds it via gc.routed_to=<rig>/gastown.polecat + --no-assignee
-    # and spawns a polecat that reads metadata.branch +
-    # metadata.rejection_reason and resumes the existing branch.
-    # Clears merge_result and blocked_reason so the bead doesn't look
-    # like terminal/handed-off state to other readers.
-    bd update "$bead_id" \
-        --status=open \
-        --assignee="" \
-        --set-metadata "gc.routed_to=$rig/gastown.polecat" \
-        --set-metadata "rejection_reason=CI failed: $fails" \
-        --set-metadata "existing_pr=$pr_url" \
-        --set-metadata "last_ci_failure=$now" \
-        --set-metadata "resling_count=$new_count" \
-        --unset-metadata merge_result \
-        --unset-metadata blocked_reason \
-        --append-notes "pr-ci-watch: CI failed ($fails); reslinging to $rig/gastown.polecat pool (attempt $new_count/$MAX_RESLINGS)." \
-        >/dev/null 2>&1 || true
-
+    resling_bead "$bead_id" "$rig" "$pr_url" "CI failed: $fails" "$resling_count"
     return 0
 }
 
