@@ -252,6 +252,142 @@ The thread closes cleanly without either human having to
 "remember to stop the loop" — the cadence collapses naturally as the
 conversation cools.
 
+## Autonomous variant (no human gesture)
+
+The protocol above gates the loop on a human gesture (one `/loop`
+per thread per side). When both humans are AFK, the suggestion line
+surfaces and waits indefinitely. openclaw flagged this as a real
+gap on 2026-05-01: cross-city collaboration stalls precisely when
+neither human is watching, which is the case the protocol most
+needs to cover.
+
+The autonomous variant closes that gap. Same heuristic, same cadence
+table, same close conditions; the *only* change is that the mayor
+calls `ScheduleWakeup` directly with a self-contained continuation
+prompt, instead of surfacing a suggestion and waiting for the human
+to type `/loop`. Both variants ship in the same fragment — picking
+between them is a per-host operator-supervision question, not a
+per-thread decision.
+
+### When the wake fires (sender + recipient triggers)
+
+**Sender side.** Every successful `gcx mail send <peer>:<role>`
+schedules ONE wake at 60 s with a continuation prompt:
+
+> Cross-city thread with `<peer>` active (subject: `<S>`). Check
+> inbox for reply. If reply present: process and reply or hold,
+> then re-schedule per age-bucket. If no reply: re-schedule per
+> age-bucket. If thread closed: exit.
+
+Multiple cross-city sends in one mayor turn collapse to a single
+wake — last write wins. Don't stack redundant wakes.
+
+**Recipient side.** Trigger on EITHER:
+
+- the existing heuristic — ≥ 2 inbounds from another mayor address
+  on the same subject prefix in the last 30 min, latest under 5 min,
+  no active loop — OR
+- **a single inbound less than 60 s old from a peer city** (autonomous
+  variant only).
+
+The single-inbound branch is more eager than the human-facing
+suggestion. Reasoning: the cost of a false positive in autonomous
+mode is one wasted wake (~60 s of cache-warm time, no LLM cost
+beyond the tick processing). The cost of a false negative — missing
+the start of an active back-and-forth where the peer human takes
+time to compose — is meaningful. The bounded-runaway guards below
+cover the "turned out not to be a real thread" case.
+
+The original ≥ 2-inbound heuristic was conservative because it
+gated a *human-facing* suggestion (annoyance cost matters). The
+autonomous variant gates only a self-scheduled wake, so the
+conservatism budget shifts. Keep the existing heuristic for the
+suggestion path; add the single-inbound branch as the
+autonomous-only trigger.
+
+### Cadence and close conditions
+
+Both unchanged from the suggest-then-loop variant. Cadence table
+(60 s / 5 min / 15 min / exit) paces by latest inbound age. Close
+conditions (`[CLOSED]` subject prefix, "closing this thread" mail
+contents, 2 h quiet from both sides) all carry over.
+
+The autonomous variant adds one extra close condition:
+
+- **5 consecutive ticks with no further inbound → exit.** Bounds
+  runaway when a trigger turned out to be a one-off ping, without
+  waiting the full 2 h timeout. At the 60 s bucket that's a 5-min
+  cap on a false-positive trigger.
+
+### Do not surface the suggestion line
+
+In autonomous mode, skip the human-facing message entirely. Don't
+print "Cross-city thread with X active. Recommend a 5-minute
+`/loop`." — you're already in the loop. The suggestion line exists
+for the *suggest-then-loop* variant only.
+
+### What this looks like to operators
+
+Mayor sessions appear "busy" between human prompts when the
+autonomous variant is active. `ScheduleWakeup`-driven turns fire
+even when the human isn't watching. That's the intent — closing the
+autonomy gap that makes mayor sessions stall on peer replies — but
+worth knowing so operators don't pattern-match it as runaway.
+
+If you see a mayor turn fire without a human prompt and want to
+confirm it's the autonomous variant rather than something unrelated:
+
+```bash
+# the most recent mayor turn started with one of these prompts
+grep -A 1 'autonomous-loop-dynamic\|Cross-city thread with' \
+  ~/<rig-root>/.gc/agents/mayor/sessions/*/transcript.jsonl 2>/dev/null \
+  | tail -5
+```
+
+The 5-tick-no-progress guard plus the 2 h thread-quiet exit bound
+the cost of any one trigger to at most ~5 min of false-positive
+loop time. The 2 h cap covers the case where messages keep flowing
+on a thread that's not actually generating useful collaboration.
+
+### Worked example: autonomous flow
+
+Reuse the earlier two-cities scenario, but neither human is at the
+keyboard.
+
+**T+0**. Yggdrasil mayor sends `[deploy] proposed cutover Friday`.
+The `gcx mail send` post-send hook schedules
+`ScheduleWakeup(60s, "Cross-city thread with midgard active …")`.
+
+**T+1 min**. Yggdrasil's autonomous wake fires. The continuation
+prompt instructs the mayor to check inbox. No reply yet (peer hasn't
+turned). Schedule next wake per cadence table — latest inbound (the
+one we sent) is < 5 min, so 60 s bucket.
+
+**T+2 min**. Same thing — still no reply. Schedule another 60 s.
+
+**T+3 min**. Midgard's mail-nudge fires (its own inbox grew by 1
+when our send landed). Midgard mayor reads inbox: single inbound,
+30 s old, peer city, autonomous variant tripped. Midgard schedules
+its own wake at 60 s. Composes a reply, sends it.
+
+**T+4 min**. Yggdrasil's autonomous wake fires. Reply present —
+process it, draft response, send. Post-send schedules another 60 s
+wake.
+
+**T+4 min … T+30 min**. Active back-and-forth. Each side's wake
+delay collapses to 60 s while the latest-inbound-age stays under
+5 min. Latency is "composing time + 60 s," not "composing time +
+(when the human next opens the terminal)."
+
+**T+45 min**. Conversation slows. Latest inbound on each side is
+now ~10 min old → 5 min wake-up bucket.
+
+**T+2 h 15 min**. No new mail in 30+ min. Each mayor's autonomous
+wake fires, latest inbound age crosses the 2 h threshold, both
+loops exit.
+
+The thread closes cleanly without either human ever typing `/loop`.
+
 ## Verification before relying on option 1
 
 The fragment ships unconditionally; what's host-specific is the
@@ -291,8 +427,24 @@ log on agent startup, the path didn't resolve — fall back to option
 ## Out of scope
 
 - Changes to the upstream gastown mayor prompt template.
-- Implementing `/loop` itself — `/loop` is a Claude Code feature and
-  the user kicks it off; this protocol only defines the
-  *suggestion-and-cadence* layer above it.
 - Any change to `gcx`. Detection runs entirely against the inbox
-  view that `gcx mail inbox` already exposes.
+  view that `gcx mail inbox` already exposes; the autonomous
+  variant's post-send wake is scheduled by the mayor (not by `gcx`)
+  in the same turn as the send, keeping `gcx` a thin transport.
+
+## Variant selection (per host)
+
+The fragment ships both variants. Selection is per host, not per
+thread:
+
+- **Suggest-then-loop** is the right default for hosts where a
+  human is reliably watching the mayor session. The one-line
+  suggestion is in-band guidance; one `/loop` gesture per thread.
+- **Autonomous** is the right default for hosts where the human is
+  expected to be AFK during cross-city collaboration. No suggestion
+  line, mayor self-schedules. Bounded by the 5-tick-no-progress
+  guard and the 2 h thread-quiet exit.
+
+Hosts choose by adopting only the relevant heuristic in their
+mayor's per-turn behavior — both detection rules live in the
+fragment side-by-side, and the cadence/close logic is shared.
