@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# gc-fix-control-dispatcher — flip named_session.mode always→on_demand on
+# the gc-binary-embedded `control-dispatcher.toml` template under each
+# town's gastown system pack.
+#
+# WHY:
+#   The `control-dispatcher` named-session has mode = "always" in the
+#   gastown pack rendered to disk by the gc binary. The reconciler keeps
+#   a dispatcher session alive at all times; when one is torn down (pool
+#   reconciler cleanup, idle exit, restart), tmux occasionally fails to
+#   kill the pty, leaving a dead `env` shell as an orphan. Observed:
+#   ~14 orphans/hr steady-state, ~970/hr during reconciler churn (~44x
+#   normal). 100% of leaked sessions match this template; no other
+#   template leaks. Tracked upstream as dv-gascity-utils#23 / gc-bn0c.
+#
+#   Flipping to mode = "on_demand" means the slot only spawns when the
+#   reconciler determines a sling needs dispatching — no always-live
+#   slot, no teardown leak.
+#
+# Files patched (skipped silently if absent):
+#   any file named `control-dispatcher.toml` under
+#   <town>/.gc/system/packs/gastown
+#
+# Idempotent: marker check. Once `mode = "always"` is gone from the
+# matched files, the helper reports "already fixed".
+#
+# Pair with gc-fix-watch — the watcher will re-apply automatically after
+# every supervisor templater wipe.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-control-dispatcher — flip control-dispatcher named_session.mode always→on_demand.
+
+Usage:
+  gc-fix-control-dispatcher [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/gastown that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-fix-control-dispatcher                        # scan ~/* and patch every gastown pack
+  gc-fix-control-dispatcher --dry-run              # preview without writing
+  gc-fix-control-dispatcher ~/yggdrasil ~/asgard   # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-fix-control-dispatcher: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+command -v perl >/dev/null 2>&1 || die "perl is required but not installed"
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs/gastown" ] && ROOTS+=("$d")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || die "no .gc/system/packs/gastown trees found under $HOME/*; pass an explicit town root"
+fi
+
+# Pattern: bare-line `mode = "always"` rewritten to `mode = "on_demand"`.
+# Anchored exactly so we don't rewrite hypothetical other surfaces (e.g.
+# a comment that mentions mode = "always" would NOT match). The trailing
+# class is `[ \t]*` (horizontal whitespace only) so `$` doesn't consume
+# the line's terminating newline — `\s*$` would, joining the patched
+# line into the next one.
+PERL_BARE='s{^mode = "always"[ \t]*$}{mode = "on_demand"}'
+
+GREP_BARE='^mode = "always"[[:space:]]*$'
+
+files_changed=0
+files_skipped=0
+files_already_fixed=0
+
+for town in "${ROOTS[@]}"; do
+    pack_root="$town/.gc/system/packs/gastown"
+    [ -d "$pack_root" ] || { echo "  skip: $town (no gastown pack)"; continue; }
+    town_label="$(basename "$town")"
+
+    # Collect any control-dispatcher.toml under the gastown pack. The gc
+    # binary embeds this file at compile time and may render it to a path
+    # that varies by version (e.g. agents/control-dispatcher/, named_sessions/),
+    # so search by basename rather than fixed relative path.
+    found=()
+    while IFS= read -r -d '' f; do
+        found+=("$f")
+    done < <(find "$pack_root" -type f -name 'control-dispatcher.toml' -print0 2>/dev/null)
+
+    if [ ${#found[@]} -eq 0 ]; then
+        echo "  skip: $town_label (no control-dispatcher.toml under gastown pack)"
+        files_skipped=$((files_skipped + 1))
+        continue
+    fi
+
+    for file in "${found[@]}"; do
+        rel="${file#$pack_root/}"
+        bare_count=$(grep -cE "$GREP_BARE" "$file" 2>/dev/null || true)
+        bare_count="${bare_count:-0}"
+
+        if [ "$bare_count" -eq 0 ]; then
+            echo "  ok (already fixed): $town_label/$rel"
+            files_already_fixed=$((files_already_fixed + 1))
+            continue
+        fi
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '  would fix [%d match(es)]: %s/%s\n' "$bare_count" "$town_label" "$rel"
+            files_changed=$((files_changed + 1))
+            continue
+        fi
+
+        perl -i -pe "$PERL_BARE" "$file"
+
+        bare_after=$(grep -cE "$GREP_BARE" "$file" 2>/dev/null || true)
+        bare_after="${bare_after:-0}"
+        applied=$((bare_count - bare_after))
+
+        if [ "$applied" -le 0 ]; then
+            printf '  warn: no changes applied to %s/%s (matched but rewrite did nothing)\n' \
+                "$town_label" "$rel" >&2
+            continue
+        fi
+
+        printf '  fixed [%d substitution(s)]: %s/%s\n' "$applied" "$town_label" "$rel"
+        files_changed=$((files_changed + 1))
+    done
+done
+
+echo
+if [ "$files_changed" -eq 0 ] && [ "$files_already_fixed" -gt 0 ]; then
+    printf 'gc-fix-control-dispatcher: %d file(s) already fixed; nothing to do.\n' "$files_already_fixed"
+elif [ "$DRY_RUN" -eq 1 ]; then
+    printf 'gc-fix-control-dispatcher: %d file(s) would be patched. Re-run without --dry-run to apply.\n' "$files_changed"
+else
+    printf 'gc-fix-control-dispatcher: %d file(s) patched, %d already fixed.\n' "$files_changed" "$files_already_fixed"
+fi
