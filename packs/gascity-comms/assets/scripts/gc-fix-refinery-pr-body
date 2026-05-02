@@ -152,19 +152,19 @@ fi
 PR_BODY=$(cat <<EOF
 ## Summary
 
-Automated pull request published by Gastown Refinery for work bead \\`$WORK\\`.
+Automated pull request published by Gastown Refinery for work bead `$WORK`.
 
 ${GH_ISSUE_REF:+$GH_ISSUE_REF}
 ${GH_ISSUE_LINK:+- **GitHub issue:** $GH_ISSUE_LINK}
-${EXTERNAL_REF:+- **External ref:** \\`$EXTERNAL_REF\\`}
-- **Work bead:** \\`$WORK\\`
-- **Branch:** \\`$BRANCH\\` → \\`$TARGET\\`
+${EXTERNAL_REF:+- **External ref:** `$EXTERNAL_REF`}
+- **Work bead:** `$WORK`
+- **Branch:** `$BRANCH` → `$TARGET`
 
 ## Changes
 
-\\`\\`\\`
+```
 $COMMIT_LOG
-\\`\\`\\`
+```
 
 ## Issue context
 
@@ -177,7 +177,7 @@ $BEAD_DESC
 - [ ] No regressions in adjacent surfaces
 
 ---
-Published by Gastown Refinery (rig: \\`${GC_RIG:-unknown}\\`).
+Published by Gastown Refinery (rig: `${GC_RIG:-unknown}`).
 EOF
 )'''
 
