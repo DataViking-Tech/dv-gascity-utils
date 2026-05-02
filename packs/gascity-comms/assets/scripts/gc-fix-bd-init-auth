@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# gc-fix-bd-init-auth — patch the bd-pack's gc-beads-bd.sh wrapper so the
+# supervisor's `init rig <name> beads: exec beads init` step picks up auth
+# credentials on hosts whose shared dolt requires a password.
+#
+# WHY:
+#   The supervisor invokes gc-beads-bd.sh from a clean environment that
+#   does not pre-source ~/.gc/secrets.env. On hosts where the shared dolt
+#   requires auth (mg's GC_DOLT_USER=beads + GC_DOLT_PASSWORD=… in
+#   ~/.gc/secrets.env), the bd init call defaults to root/empty-password,
+#   hangs, and gets SIGKILL'd by the supervisor's init timeout — blocking
+#   the entire city from coming up. Subsequent reload requests are then
+#   rejected ("keeping old config"), so the symptoms cascade until the
+#   rig is dropped from city.toml.
+#
+#   This helper applies two surgical edits to the wrapper:
+#
+#     1. Source ~/.gc/secrets.env at the top of the script (before
+#        DOLT_USER/DOLT_PASSWORD are read), and bridge MYSQL_PWD <->
+#        GC_DOLT_PASSWORD so any consumer that looks for the standard
+#        mysql/dolt env name also sees the password.
+#
+#     2. Pass --server-user "$DOLT_USER" and BEADS_DOLT_PASSWORD="$DOLT_PASSWORD"
+#        to the `bd init` invocation in op_init. Without this, bd defaults
+#        to root with no password regardless of what the wrapper read into
+#        DOLT_USER/DOLT_PASSWORD.
+#
+#   Tracked upstream as dv-gascity-utils#29. Same root-cause family as
+#   #26 (gc-rig-join preflight) and the gc-rig-init DOLT_CLI_PASSWORD=""
+#   pattern — separate fixes, one per surface.
+#
+# Files patched (skipped silently if absent):
+#   <town>/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh
+#
+# Idempotent: marker checks. Once both patches land, subsequent runs
+# report "already fixed".
+#
+# Pair with gc-fix-watch — the watcher will re-apply automatically after
+# every supervisor templater wipe of the bd pack.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-bd-init-auth — make the bd init wrapper honor secrets.env / MYSQL_PWD.
+
+Usage:
+  gc-fix-bd-init-auth [options] [town-root ...]
+
+Default scan: every $HOME/<town>/.gc/system/packs/bd that exists.
+Pass explicit town-root paths as positional args to override discovery.
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-fix-bd-init-auth                          # scan ~/* and patch every bd pack
+  gc-fix-bd-init-auth --dry-run                # preview without writing
+  gc-fix-bd-init-auth ~/yggdrasil ~/asgard     # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-fix-bd-init-auth: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not installed"
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs/bd" ] && ROOTS+=("$d")
+    done
+fi
+
+[ ${#ROOTS[@]} -gt 0 ] || die "no .gc/system/packs/bd trees found under $HOME/*; pass an explicit town root"
+
+# patch_with_python <file> <python-script>
+# Returns the file with one patch applied. Idempotent at the python layer
+# (script writes input unchanged when its marker is already present).
+patch_with_python() {
+    local file="$1" script="$2" label="$3"
+    local tmp; tmp=$(mktemp)
+    if ! python3 -c "$script" <"$file" >"$tmp"; then
+        rm -f "$tmp"
+        die "python patch failed on $file ($label)"
+    fi
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        echo "    ok ($label, already fixed)"
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        rm -f "$tmp"
+        echo "    would patch ($label)"
+        return 0
+    fi
+    # Preserve the original mode (the wrapper is exec'd by the supervisor
+    # so the executable bit must survive the rewrite).
+    local orig_mode
+    orig_mode=$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file" 2>/dev/null || echo 755)
+    mv "$tmp" "$file"
+    chmod "$orig_mode" "$file"
+    echo "    patched ($label)"
+}
+
+# --- Patch 1: insert auth bootstrap block above the DOLT_HOST assignment.
+# Sources ~/.gc/secrets.env if present and bridges MYSQL_PWD <->
+# GC_DOLT_PASSWORD so the wrapper reads the password the supervisor's
+# environment lacks. Marker: the literal "bd-init-auth: source" comment.
+read -r -d '' AUTH_BOOTSTRAP_PATCH <<'PYEOF' || true
+import sys
+src = sys.stdin.read()
+if "bd-init-auth: source" in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+old = '''# --- Configuration ---
+
+# DOLT_PORT is set after derived paths are resolved (see allocate_port below).
+DOLT_HOST="${GC_DOLT_HOST:-0.0.0.0}"'''
+
+new = '''# --- Configuration ---
+
+# bd-init-auth: source ~/.gc/secrets.env so the supervisor's bd-init step
+# picks up GC_DOLT_USER/GC_DOLT_PASSWORD without the supervisor having to
+# pre-load the file itself. MYSQL_PWD is the standard mysql/dolt env name
+# and is bridged both directions so consumers that look for either name
+# find the password. Fixes dv-gascity-utils#29.
+if [ -z "${GC_DOLT_PASSWORD:-}" ] && [ -r "${HOME:-}/.gc/secrets.env" ]; then
+    set -a
+    . "${HOME}/.gc/secrets.env"
+    set +a
+fi
+if [ -z "${GC_DOLT_PASSWORD:-}" ] && [ -n "${MYSQL_PWD:-}" ]; then
+    GC_DOLT_PASSWORD="$MYSQL_PWD"
+fi
+if [ -z "${MYSQL_PWD:-}" ] && [ -n "${GC_DOLT_PASSWORD:-}" ]; then
+    MYSQL_PWD="$GC_DOLT_PASSWORD"
+    export MYSQL_PWD
+fi
+
+# DOLT_PORT is set after derived paths are resolved (see allocate_port below).
+DOLT_HOST="${GC_DOLT_HOST:-0.0.0.0}"'''
+
+if old not in src:
+    sys.stderr.write(
+        "gc-fix-bd-init-auth: anchor block for the auth bootstrap was not found. "
+        "The upstream wrapper may have shifted shape — re-check the "
+        "`# --- Configuration ---` / DOLT_HOST anchor in gc-beads-bd.sh and "
+        "update the `old` string in this helper.\n"
+    )
+    sys.exit(2)
+
+sys.stdout.write(src.replace(old, new, 1))
+PYEOF
+
+# --- Patch 2: enrich the bd init invocation with --server-user and the
+# BEADS_DOLT_PASSWORD env var. Without this, bd defaults to root/empty
+# even after patch 1 populates DOLT_USER/DOLT_PASSWORD — bd's auth flags
+# are independent of the wrapper's `dolt --user/--password` calls.
+# Marker: the literal `BEADS_DOLT_PASSWORD="$DOLT_PASSWORD" bd init`.
+read -r -d '' BD_INIT_PATCH <<'PYEOF' || true
+import sys
+src = sys.stdin.read()
+if 'BEADS_DOLT_PASSWORD="$DOLT_PASSWORD" bd init' in src:
+    sys.stdout.write(src)
+    sys.exit(0)
+
+old = '    (cd "$dir" && bd init --quiet --server -p "$init_prefix" --skip-hooks --skip-agents         --server-host "$host" --server-port "$DOLT_PORT"         "$dir") || die "bd init failed for $dir"'
+new = '    (cd "$dir" && BEADS_DOLT_PASSWORD="$DOLT_PASSWORD" bd init --quiet --server -p "$init_prefix" --skip-hooks --skip-agents         --server-host "$host" --server-port "$DOLT_PORT" --server-user "$DOLT_USER"         "$dir") || die "bd init failed for $dir"'
+
+if old not in src:
+    sys.stderr.write(
+        "gc-fix-bd-init-auth: literal `bd init` invocation in op_init was not "
+        "found. Re-check the line in gc-beads-bd.sh and update the `old` string "
+        "in this helper.\n"
+    )
+    sys.exit(2)
+
+sys.stdout.write(src.replace(old, new, 1))
+PYEOF
+
+echo "Scanning ${#ROOTS[@]} root(s):"
+printf '  %s\n' "${ROOTS[@]}"
+echo
+
+for root in "${ROOTS[@]}"; do
+    pack="$root/.gc/system/packs/bd"
+    [ -d "$pack" ] || { echo "  skip (no bd pack): ${root#$HOME/}"; continue; }
+    file="$pack/assets/scripts/gc-beads-bd.sh"
+    if [ ! -f "$file" ]; then
+        echo "  skip (no gc-beads-bd.sh): ${root#$HOME/}"
+        continue
+    fi
+    echo "  ${file#$HOME/}:"
+    patch_with_python "$file" "$AUTH_BOOTSTRAP_PATCH" "secrets.env bootstrap"
+    patch_with_python "$file" "$BD_INIT_PATCH" "bd init --server-user/BEADS_DOLT_PASSWORD"
+done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo
+    echo "dry-run complete; no files were changed"
+else
+    echo
+    echo "done. Re-run safely; subsequent runs report 'already fixed'."
+fi

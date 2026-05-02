@@ -116,6 +116,7 @@ HELPERS=(
     "gc-audit-alias-mismatch"
     "gc-fix-runtime-restart"
     "gc-fix-control-dispatcher"
+    "gc-fix-bd-init-auth"
     "gc-fix-watch"
     "gc-events-rotate"
     "gc-reload-orders"
