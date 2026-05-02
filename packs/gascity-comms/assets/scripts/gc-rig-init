@@ -14,19 +14,38 @@
 #
 # This helper:
 #
+#   0. (NEW, 2026-05-02) Pre-create check: scans the shared dolt server
+#      for any existing database whose `metadata.github_repo` row matches
+#      this rig's git origin. If found, prints join instructions and
+#      exits non-zero — preventing accidental duplicate-DB creation when
+#      a second city is being set up against an already-tracked repo.
+#      Skipped when the rig has no GitHub origin remote, or when run
+#      with --no-multi-city-check.
 #   1. Invokes `gc rig add <path> [--include <pack>]` (skipped if rig
 #      already registered).
 #   2. Rewrites the broken `includes = [...]` block in city.toml to the
 #      expanding `[rigs.imports.<pack>] source = ".gc/system/packs/<pack>"`
 #      form.
-#   3. Runs `bd init --force --prefix <p>` in the rig directory.
-#   4. Adds the standard polecat/refinery scaling overrides
+#   3. Adds the standard polecat/refinery scaling overrides
 #      (polecat min_active=0, refinery min_active=1) to match the rest of
 #      the city.
+#   4. Runs `bd init --force --prefix <p>` in the rig directory.
+#   5. (NEW, 2026-05-02) Writes the rig's `metadata.github_repo` row to
+#      the new dolt database, in canonical `owner/repo` form. This is
+#      the join key step 0 reads on the next run anywhere.
+#
+# Backfill mode (--backfill-github-repo): walks every rig in the current
+# city, reads `git remote get-url origin`, and writes the github_repo
+# metadata row to the rig's dolt database. Idempotent. Use this once on
+# each host before relying on step 0 to catch duplicates — pre-existing
+# rigs created before the metadata convention won't be detected
+# otherwise.
 #
 # Idempotent: re-running on a fully-set-up rig is a no-op (apart from the
 # `bd init --force` which is itself idempotent — it rewrites the schema
-# from the existing prefix).
+# from the existing prefix). Step 0 check honors existing `--adopt`
+# semantics: if the target rig path's `.beads/` already exists, the
+# user is expected to use `gc-rig-join` (handled separately).
 
 set -euo pipefail
 
@@ -41,19 +60,32 @@ Required:
   <rig-path>          Absolute path to the rig directory (must be a git repo).
 
 Options:
-  --name <name>       Rig name. Default: basename of rig-path.
-  --include <pack>    System pack to include (default: gastown).
-                      Use --no-include to skip the imports block entirely.
-  --no-include        Don't add any pack import.
-  --prefix <prefix>   Bead ID prefix. Default: derived from name (per gc binary).
-  --no-scaling        Don't add the polecat/refinery scaling overrides.
-  --dry-run           Print what would happen; touch nothing.
-  -h, --help          Show this help.
+  --name <name>             Rig name. Default: basename of rig-path.
+  --include <pack>          System pack to include (default: gastown).
+                            Use --no-include to skip the imports block entirely.
+  --no-include              Don't add any pack import.
+  --prefix <prefix>         Bead ID prefix. Default: derived from name (per gc binary).
+  --no-scaling              Don't add the polecat/refinery scaling overrides.
+  --no-multi-city-check     Skip the pre-create scan for an existing dolt
+                            database tracking this same GitHub repo. Use
+                            when you intentionally want a duplicate DB
+                            (rare).
+  --backfill-github-repo    One-shot mode: walk every rig in the current
+                            city, read its git origin, and write the
+                            metadata.github_repo row to its dolt
+                            database. Idempotent. Use once per host
+                            before relying on the pre-create check to
+                            detect cross-city duplicates of pre-existing
+                            rigs. Mutually exclusive with normal create
+                            mode (rig-path must NOT be passed).
+  --dry-run                 Print what would happen; touch nothing.
+  -h, --help                Show this help.
 
 Examples:
   gc-rig-init /Users/mani/dataviking-site
   gc-rig-init /Users/mani/myproject --include gastown --prefix myp
   gc-rig-init ~/foo --dry-run
+  gc-rig-init --backfill-github-repo
 EOF
 }
 
@@ -63,6 +95,8 @@ INCLUDE_PACK="gastown"
 NO_INCLUDE=0
 PREFIX=""
 NO_SCALING=0
+NO_MULTI_CITY_CHECK=0
+BACKFILL_GITHUB_REPO=0
 DRY_RUN=0
 
 die() { echo "gc-rig-init: $*" >&2; exit 2; }
@@ -78,6 +112,8 @@ while [ $# -gt 0 ]; do
         --prefix) shift; [ $# -gt 0 ] || die "--prefix requires an argument"; PREFIX="$1"; shift ;;
         --prefix=*) PREFIX="${1#--prefix=}"; shift ;;
         --no-scaling) NO_SCALING=1; shift ;;
+        --no-multi-city-check) NO_MULTI_CITY_CHECK=1; shift ;;
+        --backfill-github-repo) BACKFILL_GITHUB_REPO=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -*) die "unknown option: $1" ;;
         *)
@@ -91,12 +127,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$RIG_PATH" ] || { usage; exit 2; }
-[ -d "$RIG_PATH" ] || die "rig path does not exist: $RIG_PATH"
+if [ "$BACKFILL_GITHUB_REPO" -eq 1 ]; then
+    [ -z "$RIG_PATH" ] || die "--backfill-github-repo and rig-path are mutually exclusive"
+else
+    [ -n "$RIG_PATH" ] || { usage; exit 2; }
+    [ -d "$RIG_PATH" ] || die "rig path does not exist: $RIG_PATH"
 
-# Make absolute.
-RIG_PATH="$(cd "$RIG_PATH" && pwd)"
-[ -z "$RIG_NAME" ] && RIG_NAME="$(basename "$RIG_PATH")"
+    # Make absolute.
+    RIG_PATH="$(cd "$RIG_PATH" && pwd)"
+    [ -z "$RIG_NAME" ] && RIG_NAME="$(basename "$RIG_PATH")"
+fi
 
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -108,6 +148,109 @@ run() {
 
 log() { printf '[gc-rig-init] %s\n' "$*"; }
 warn() { printf '[gc-rig-init] warn: %s\n' "$*" >&2; }
+
+# -----------------------------------------------------------------------
+# Dolt SQL helper. Discovers the local dolt port from the city's runtime
+# state file (managed dolt) and falls back to GC_DOLT_PORT or 3307. The
+# host is always 127.0.0.1 — both yg + mg + asgard run dolt on
+# loopback. Override via GC_DOLT_PORT for non-default deployments.
+# -----------------------------------------------------------------------
+
+dolt_port_for_city() {
+    local city_root="$1"
+    local state_file="$city_root/.gc/runtime/packs/dolt/dolt-state.json"
+    if [ -f "$state_file" ]; then
+        # Extract the "port" field with sed (state file is JSON but jq
+        # is not guaranteed on every host; sed is portable). The field
+        # name is just "port" — verified against gc 1.0.0 dolt-state
+        # shape on yg + asgard.
+        local p
+        p=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$state_file" | head -1)
+        [ -n "$p" ] && { printf '%s' "$p"; return; }
+    fi
+    printf '%s' "${GC_DOLT_PORT:-3307}"
+}
+
+dolt_sql() {
+    local query="$1"
+    local port
+    port=$(dolt_port_for_city "$CITY_ROOT")
+    DOLT_CLI_PASSWORD="" dolt --host 127.0.0.1 --port "$port" --user root --no-tls sql -r csv -q "$query" 2>/dev/null
+}
+
+# Strip CSV header (first line) from dolt output.
+dolt_sql_rows() {
+    dolt_sql "$1" | tail -n +2
+}
+
+# -----------------------------------------------------------------------
+# GitHub-repo identity helpers. Canonical form is "owner/repo" with no
+# scheme, no trailing .git. Two rigs at the same logical repo will
+# produce the same slug regardless of clone URL flavor (https vs ssh).
+# -----------------------------------------------------------------------
+
+repo_slug_for_path() {
+    local rig_path="$1"
+    local url
+    url=$(git -C "$rig_path" remote get-url origin 2>/dev/null || true)
+    [ -z "$url" ] && return 0
+    case "$url" in
+        https://github.com/*|git@github.com:*) ;;
+        *) return 0 ;;
+    esac
+    printf '%s' "$url" | sed -E '
+        s#^https://github\.com/([^/]+/[^/.]+)(\.git)?/?$#\1#
+        s#^git@github\.com:([^/]+/[^/.]+)(\.git)?$#\1#
+    '
+}
+
+# find_existing_db_for_repo <slug> -> stdout: "<db>" of first match (or empty)
+# Iterates SHOW DATABASES, skips system + probe DBs, queries each for
+# metadata.github_repo. First match wins (mostly there's at most one).
+find_existing_db_for_repo() {
+    local slug="$1"
+    [ -z "$slug" ] && return 0
+    local dbs
+    dbs=$(dolt_sql_rows "SHOW DATABASES" 2>/dev/null || true)
+    [ -z "$dbs" ] && return 0
+    while IFS= read -r db; do
+        case "$db" in
+            ''|information_schema|mysql|dolt_cluster|__gc_probe) continue ;;
+        esac
+        # Some dbs may not have a metadata table (very fresh init); the
+        # query errors and dolt_sql swallows it. Empty result == no match.
+        local val
+        val=$(dolt_sql_rows \
+            "SELECT value FROM \`$db\`.metadata WHERE \`key\` = 'github_repo' LIMIT 1" \
+            2>/dev/null || true)
+        # value is the second-and-onward field; with one column the row
+        # IS the value. Strip CR if any.
+        val=$(printf '%s' "$val" | tr -d '\r')
+        if [ "$val" = "$slug" ]; then
+            printf '%s' "$db"
+            return 0
+        fi
+    done <<< "$dbs"
+    return 0
+}
+
+# write_github_repo_metadata <db> <slug>
+# Writes (or updates) the github_repo row in <db>.metadata. UPSERT via
+# REPLACE INTO since metadata's key column is the primary key.
+write_github_repo_metadata() {
+    local db="$1" slug="$2"
+    [ -z "$db" ] || [ -z "$slug" ] && return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "would write metadata.github_repo='$slug' to db '$db'"
+        return 0
+    fi
+    # Quote the value just in case (slugs are owner/repo, no quote chars).
+    DOLT_CLI_PASSWORD="" dolt --host 127.0.0.1 --port "$(dolt_port_for_city "$CITY_ROOT")" \
+        --user root --no-tls sql -q \
+        "REPLACE INTO \`$db\`.metadata (\`key\`, \`value\`) VALUES ('github_repo', '$slug')" \
+        >/dev/null 2>&1 \
+        || warn "failed to write metadata.github_repo to db '$db'"
+}
 
 # Find the city root (first directory walking up from cwd that has a city.toml).
 find_city_root() {
@@ -126,16 +269,137 @@ CITY_ROOT="$(find_city_root)"
 [ -n "$CITY_ROOT" ] || die "no city.toml found walking up from $PWD"
 CITY_TOML="$CITY_ROOT/city.toml"
 log "city: $CITY_ROOT"
+
+# -----------------------------------------------------------------------
+# --backfill-github-repo mode (mutually exclusive with normal create).
+# Walk every rig in this city, read its git origin, write the metadata
+# row. Runs once per host, after deploying this updated helper, before
+# relying on the pre-create check to detect duplicates.
+# -----------------------------------------------------------------------
+
+if [ "$BACKFILL_GITHUB_REPO" -eq 1 ]; then
+    log "backfill mode: scanning rigs in $CITY_ROOT"
+    # Parse [[rigs]] blocks for name + path. Mirrors pr-ci-watch.sh's parser.
+    if ! command -v gc >/dev/null 2>&1; then
+        die "gc binary not on PATH; backfill needs 'gc config show'"
+    fi
+    config_output=$(gc config show 2>/dev/null) || die "gc config show failed"
+
+    current_rig=""
+    in_rigs=0
+    rig_count=0
+    matched=0
+    skipped=0
+    while IFS= read -r line; do
+        if [[ "$line" == "[[rigs]]" ]]; then
+            in_rigs=1
+            current_rig=""
+            continue
+        fi
+        if [[ "$line" =~ ^\[ && "$line" != "[[rigs]]" && ! "$line" =~ ^\[rigs\. ]]; then
+            in_rigs=0
+            current_rig=""
+            continue
+        fi
+        [[ "$in_rigs" -eq 1 ]] || continue
+        if [[ "$line" =~ ^name[[:space:]]*=[[:space:]]*\"(.+)\"$ && -z "$current_rig" ]]; then
+            current_rig="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^path[[:space:]]*=[[:space:]]*\"(.+)\"$ && -n "$current_rig" ]]; then
+            rp="${BASH_REMATCH[1]}"
+            rig_count=$((rig_count + 1))
+            # Read prefix from the rig's metadata.json (.beads/metadata.json#dolt_database).
+            meta="$rp/.beads/metadata.json"
+            pfx=""
+            if [ -f "$meta" ]; then
+                pfx=$(sed -n 's/.*"dolt_database"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" | head -1)
+            fi
+            slug=$(repo_slug_for_path "$rp")
+            if [ -z "$pfx" ] || [ -z "$slug" ]; then
+                skipped=$((skipped + 1))
+                printf '  skip %s: ' "$current_rig"
+                [ -z "$pfx" ] && printf 'no dolt prefix; ' || true
+                [ -z "$slug" ] && printf 'no GitHub origin; ' || true
+                printf '\n'
+                current_rig=""
+                continue
+            fi
+            existing=$(dolt_sql_rows \
+                "SELECT value FROM \`$pfx\`.metadata WHERE \`key\` = 'github_repo' LIMIT 1" \
+                2>/dev/null | tr -d '\r' || true)
+            if [ "$existing" = "$slug" ]; then
+                printf '  ok (already set) %s: db=%s slug=%s\n' "$current_rig" "$pfx" "$slug"
+                matched=$((matched + 1))
+            else
+                if [ "$DRY_RUN" -eq 1 ]; then
+                    printf '  would write %s: db=%s slug=%s\n' "$current_rig" "$pfx" "$slug"
+                else
+                    write_github_repo_metadata "$pfx" "$slug"
+                    printf '  wrote %s: db=%s slug=%s\n' "$current_rig" "$pfx" "$slug"
+                    matched=$((matched + 1))
+                fi
+            fi
+            current_rig=""
+        fi
+    done <<< "$config_output"
+    log "backfill: scanned=$rig_count, matched=$matched, skipped=$skipped"
+    exit 0
+fi
+
 log "rig:  $RIG_PATH (name=$RIG_NAME)"
+
+# --- Step 0: multi-city duplicate-DB check ---
+
+REPO_SLUG=""
+EXISTING_DB=""
+if [ "$NO_MULTI_CITY_CHECK" -eq 0 ]; then
+    log "step 0/5: scanning shared dolt for existing DB tracking this repo"
+    REPO_SLUG=$(repo_slug_for_path "$RIG_PATH")
+    if [ -z "$REPO_SLUG" ]; then
+        log "  no GitHub origin remote; skipping multi-city check"
+    else
+        log "  repo slug: $REPO_SLUG"
+        if ! command -v dolt >/dev/null 2>&1; then
+            warn "  dolt CLI not on PATH; skipping multi-city check"
+        else
+            EXISTING_DB=$(find_existing_db_for_repo "$REPO_SLUG")
+            if [ -n "$EXISTING_DB" ]; then
+                cat >&2 <<EOF
+
+[gc-rig-init] HALT: an existing dolt database already tracks repo '$REPO_SLUG':
+
+    database:    $EXISTING_DB
+    repo slug:   $REPO_SLUG
+
+This means another city has already initialized a bead pool for this
+repo. Creating a new rig+DB here would split the bead pool across two
+unrelated databases — polecats on each side would scan different
+queues.
+
+Use 'gc-rig-join' instead to adopt the existing database:
+
+    gc-rig-join $RIG_PATH --prefix $EXISTING_DB
+
+If you intentionally want a separate DB (rare — e.g., reserving a
+fork as a distinct project), re-run with --no-multi-city-check.
+
+See dv-gascity-utils/docs/shared-rig-prefix.md for full context.
+
+EOF
+                exit 3
+            fi
+            log "  no existing DB tracking '$REPO_SLUG'; proceeding"
+        fi
+    fi
+fi
 
 # --- Step 1: gc rig add (skip if already in city.toml) ---
 
 ALREADY_IN_CITY=0
 if grep -qE "^name = \"$RIG_NAME\"$" "$CITY_TOML" 2>/dev/null; then
-    log "step 1/4: rig '$RIG_NAME' already in city.toml; skipping 'gc rig add'"
+    log "step 1/5: rig '$RIG_NAME' already in city.toml; skipping 'gc rig add'"
     ALREADY_IN_CITY=1
 else
-    log "step 1/4: invoking 'gc rig add'"
+    log "step 1/5: invoking 'gc rig add'"
     if [ "$NO_INCLUDE" -eq 1 ]; then
         run gc rig add "$RIG_PATH" --name "$RIG_NAME"
     else
@@ -146,7 +410,7 @@ fi
 # --- Step 2: rewrite broken includes block (if present) ---
 
 if [ "$NO_INCLUDE" -eq 0 ] && [ -n "$INCLUDE_PACK" ]; then
-    log "step 2/4: checking city.toml includes shape for rig '$RIG_NAME'"
+    log "step 2/5: checking city.toml includes shape for rig '$RIG_NAME'"
 
     # Detect the broken `includes = ["packs/<pack>"]` shape under our rig
     # block. Use a small perl program to operate on the file as a whole
@@ -184,7 +448,7 @@ fi
 # --- Step 3: scaling overrides ---
 
 if [ "$NO_SCALING" -eq 0 ]; then
-    log "step 3/4: ensuring polecat + refinery scaling overrides for rig '$RIG_NAME'"
+    log "step 3/5: ensuring polecat + refinery scaling overrides for rig '$RIG_NAME'"
 
     # Look for any existing scaling override block under this rig. If not
     # present, append. We append at the end of the rig's block, before
@@ -264,7 +528,7 @@ fi
 if [ -z "$PREFIX" ]; then
     warn "could not determine bead prefix for rig '$RIG_NAME'; skipping 'bd init'"
 else
-    log "step 4/4: completing bd schema bootstrap (prefix=$PREFIX)"
+    log "step 4/5: completing bd schema bootstrap (prefix=$PREFIX)"
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would probe bd create; run 'bd init --force --prefix $PREFIX' only if probe fails AND rig has 0 beads"
     else
@@ -306,6 +570,27 @@ else
         cd - >/dev/null
         set -e
     fi
+fi
+
+# --- Step 5: write metadata.github_repo (multi-city join key) ---
+
+if [ -n "$REPO_SLUG" ] && [ -n "$PREFIX" ]; then
+    log "step 5/5: writing metadata.github_repo='$REPO_SLUG' to db '$PREFIX'"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  would write metadata.github_repo='$REPO_SLUG' to db '$PREFIX'"
+    else
+        # Sanity check: dolt db actually exists. If gc rig add was a
+        # dry-run or failed earlier, the db isn't there and the write
+        # would error. Skip silently in that case.
+        if dolt_sql_rows "SHOW DATABASES" | grep -qx "$PREFIX"; then
+            write_github_repo_metadata "$PREFIX" "$REPO_SLUG"
+            log "  wrote metadata.github_repo to db '$PREFIX'"
+        else
+            warn "  db '$PREFIX' not present on dolt server; skipping github_repo write"
+        fi
+    fi
+elif [ -z "$REPO_SLUG" ] && [ "$NO_MULTI_CITY_CHECK" -eq 0 ]; then
+    log "step 5/5: skipping (no GitHub origin remote — nothing to write)"
 fi
 
 log "done."
