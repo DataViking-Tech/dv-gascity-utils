@@ -1,0 +1,48 @@
+# gascity-stability — host-stability detection layer for Gas City.
+#
+# Importable doctor checks that detect operational gaps the gc binary
+# doesn't surface on its own: silent reload rejections, orders that
+# ship but never load, agents that drain without auto-restarting,
+# pools that don't ramp before their orders fail.
+#
+# Independent of cross-city tooling. A city that wants gc-doctor
+# visibility into supervisor health, dispatch correctness, and pool
+# behavior can import this pack without taking on the gateway /
+# peers.toml / gcx machinery from gascity-comms.
+#
+# Ships:
+#   - doctor/check-reload-state — parses supervisor.log for the most
+#     recent reload outcome; fails when 'keeping old config' is the
+#     latest event. Catches the silent-failure cascade where a single
+#     rejected reload makes ALL subsequent city.toml edits invisibly
+#     drop against the running controller.
+#     See dv-gascity-utils/docs/known-binary-bugs.md
+#     'supervisor reload silent-failure cascade'.
+#   - doctor/check-orders-discovery — for each pack imported via city
+#     pack.toml, walks the pack's orders/ directory and warns on any
+#     <name>.toml entries missing from `gc order list`. Catches the
+#     docs+binary divergence where top-level imports load
+#     agents/fragments but skip orders.
+#     See dv-gascity-utils/docs/known-binary-bugs.md
+#     'orders shipped in top-level imported packs are not loaded'.
+#   - doctor/check-deacon-drain-recovery — flags gastown.deacon
+#     sessions that drained without auto-restart (asleep, closed, or
+#     stale-active past threshold). Catches the structural autonomy
+#     gap where mail-nudge can't wake an idle Claude Code session.
+#   - doctor/check-pool-ramp — flags beads routed to a polecat / dog /
+#     refinery pool that haven't been picked up within the ramp
+#     threshold. Catches the pool-spawn delay where the gate-sweep
+#     fires but pool reconcile hangs further down.
+#
+# Importable into any Gas City workspace:
+#
+#   # In your city's pack.toml:
+#   [imports.gascity-stability]
+#     source = "/absolute/path/to/dv-gascity-utils/packs/gascity-stability"
+#
+# After import, run via `gc doctor` (the standard doctor harness picks
+# up doctor/check-*/run.sh from imported packs).
+
+[pack]
+name = "gascity-stability"
+schema = 2

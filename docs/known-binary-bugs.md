@@ -375,6 +375,68 @@ See `docs/pack-template-resilience.md` for the full design + install instruction
 
 ---
 
+## bd auto-backup hook tries to mkdir the user's home dir
+
+**Trackers**: dv-gascity-utils issue #32 (filed 2026-05-02 from midgard).
+
+**Symptom**: every `bd create` / `bd update` / `bd close` hangs 30s+ on a failing post-write hook chain. Stderr shows:
+
+```
+Warning: auto-backup failed: register backup remote: add backup backup_export:
+  Error 1105 (HY000): failed to create directory '/Users/<user>/<rig>/.beads/backup':
+  mkdir /Users/<user>: permission denied
+Warning: auto-export: git add failed: exit status 1
+```
+
+The hook is trying to `mkdir /Users/<user>` (the user's home directory) instead of creating the intended `<rig-root>/.beads/backup` subdirectory. Looks like a parent-dir path-resolution bug — the hook walks up the tree and tries to create the topmost component instead of creating the leaf with `mkdir -p`.
+
+**Evidence**: the dolt row update completes in ~50ms (verifiable via direct `gc dolt sql` query). The remaining ~30-120s is the hook chain timing out. `pkill -f "bd update"` is the fastest recovery; you'll see 4 child processes per stuck bd command (the hook chain).
+
+**Class**: C — bd binary bug. The hook isn't toggleable through any documented config.
+
+**Workaround**: none clean. Mitigation: when slinging multiple beads, do them sequentially (don't fire 3 in parallel — they all fight the same failing mkdir and the throughput is the same). Verify writes via direct dolt query (`echo "SELECT id, ... FROM <rig>.issues WHERE id='<bead>'" | gc dolt sql`) rather than waiting for `bd update` to return.
+
+**Detection**: a dedicated `bd-throughput` doctor check (run a synthetic bd update + time it; fail if >5s) would be the targeted detector if this stays unfixed.
+
+---
+
+## supervisor reload silent-failure cascade (rejected reloads keep accumulating)
+
+**Trackers**: dv-gascity-utils issues #29, #30 (root-cause auth bug); detection check at `gascity-stability/doctor/check-reload-state`.
+
+**Symptom**: `gc supervisor reload` returns "Reconciliation triggered." cleanly. The supervisor log emits a single `gc supervisor: config reload: validating ...: ... (keeping old config)` line. From every operator-visible surface — `gc reload`, `gc config show`, `gc rig list` — the new config looks live. But the controller's running config snapshot is unchanged from supervisor startup.
+
+ALL subsequent edits to `city.toml` (`[[orders.overrides]] enabled = false`, new `[[rigs]]`, etc.) are silently dropped against the running controller. New orders defined in newly-imported packs don't enter the dispatch loop. Operators can spend hours editing config and watching nothing happen.
+
+**Triggers observed**:
+- Duplicate-mayor agent collision (workspace pack auto-discovers `agents/<role>/` and collides with imported pack — see PR #17 wiring-gap doc, this is the most common path)
+- Adopted rig with `gc.endpoint_status: unverified` triggering bd init that hits the auth bug (#29)
+- `inherited_city` endpoint without explicit `dolt.host`/`dolt.port` even when city.toml has `[dolt]` set (#30)
+
+**Class**: C — needs upstream fix to the validator (per-error reload should emit a louder signal than a single log line; ideally non-zero exit on `gc supervisor reload`).
+
+**Workaround**: run `check-reload-state` after every `gc supervisor reload` / `gc-reload-orders` invocation. Helper exit 1 = controller is on stale snapshot; investigate the rejection reason and fix the underlying validation error before assuming any subsequent edits are live.
+
+---
+
+## orders shipped in top-level imported packs are not loaded
+
+**Trackers**: dv-gascity-utils issue #31 (resolution shipped as `gc-reload-orders`); detection check at `gascity-stability/doctor/check-orders-discovery`.
+
+**Symptom**: `docs/cross-city-comms.md` step 8 says: "Enable the mail-nudge order in your city's pack imports (gascity-comms is imported via your city's pack.toml; the order ships with the pack and runs once the pack is loaded)." This is wrong. Top-level `[imports.X]` in city `pack.toml` loads the pack's agents and template-fragments but skips its `orders/` directory entirely.
+
+`gc only` walks `orders/` from packs reachable through the maintenance import chain (i.e. packs inside `.gc/system/packs/` transitively imported via gastown). Standalone top-level imports get their non-order content but not their orders.
+
+**Concrete impact (mg, 2026-05-02)**: `mail-nudge` shipped in `gascity-comms/orders/mail-nudge.toml`, imported via `pack.toml [imports.gascity-comms]`. Order never appeared in `gc order list`. Cross-city wake-on-arrival was structurally broken for 4+ days before detection.
+
+**Class**: C for the binary; the docs+binary divergence is the operational bug.
+
+**Workaround**: drop a copy of the order .toml into `.gc/system/packs/maintenance/orders/<name>.toml` and symlink the script (if the order's `exec` references `$PACK_DIR/assets/scripts/<name>.sh`) into `maintenance/assets/scripts/`. After change: `gc-reload-orders` (controlled supervisor cycle) so the dispatch loop picks it up.
+
+**Detection**: `check-orders-discovery` walks each `[imports.X]` source pack's `orders/`, diffs against `gc order list`, and flags missing entries. Run as part of `gc doctor`.
+
+---
+
 ## How to add a new entry
 
 1. Reproduce on at least one host. Capture exact error strings + binary version.
