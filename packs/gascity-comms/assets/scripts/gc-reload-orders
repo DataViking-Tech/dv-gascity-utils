@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# gc-reload-orders — apply order/override changes by performing a safe
+# supervisor cycle (the only path that actually refreshes the
+# controller's order-dispatch tables in the current gc binary).
+#
+# WHY:
+#   `gc supervisor reload` (and `gc reload`) refresh resolved config —
+#   `gc config show` and `gc order list` reflect the change immediately
+#   — but the supervisor's order-dispatch loop keeps using the
+#   pre-reload active-orders set. New orders dropped under
+#   `<pack>/orders/*.toml` show up in the catalog and run via
+#   `gc order run <name>` on demand, but the auto-dispatch tick won't
+#   schedule them until the supervisor is fully restarted. Same shape
+#   for `[[orders.overrides]] enabled = false` — accepted by the
+#   validator, surfaced by `gc config show`, but the order keeps firing
+#   every cooldown until restart.
+#
+#   This is a Class C bug in the compiled gc binary (see
+#   docs/known-binary-bugs.md "supervisor reload doesn't refresh order
+#   dispatch tables"). No Class A/B host-local fix is possible because
+#   the dispatch table lives in supervisor memory and is bound at
+#   startup. The reliable workaround is a controlled supervisor cycle:
+#   graceful stop → verify exit (with SIGKILL fallback for the
+#   SIGTERM-ignore bug) → ensure launchd brings the new supervisor up
+#   (re-bootstrap if drifted) → confirm.
+#
+# WHAT it does:
+#   1. (Optional) Calls `gc supervisor reload` first so the resolved
+#      config is hot when the new supervisor starts (cheap; saves one
+#      pack-templater roundtrip on the cold path).
+#   2. Captures the running supervisor PID.
+#   3. Calls `gc supervisor stop`, watches up to ~15s for actual exit
+#      (the return message is unreliable — see Known SIGTERM-ignore bug).
+#   4. If still alive: SIGKILL.
+#   5. Verifies the supervisor came back up under launchd (Darwin) or
+#      systemd --user (Linux). If it didn't, re-bootstraps the unit.
+#   6. Confirms with `gc supervisor status`.
+#
+# Idempotent: if no supervisor is running, the stop is skipped and the
+# bootstrap path takes over. Safe to re-run.
+#
+# Cost: the cycle drops every agent across every rig and city served by
+# this supervisor (witnesses, refineries, deacons, polecats). Active
+# polecat work loses its session (worktree + bead state preserved). Use
+# during a maintenance window, not as a routine fix for transient
+# issues.
+
+set -euo pipefail
+
+# --- Defaults -----------------------------------------------------------
+
+DRY_RUN=0
+QUIET=0
+SKIP_RELOAD=0
+STOP_GRACE_SECONDS=15
+PORT=8372
+PLIST_PATH_DEFAULT="$HOME/Library/LaunchAgents/com.gascity.supervisor.plist"
+
+# --- Helpers ------------------------------------------------------------
+
+die() { echo "gc-reload-orders: $*" >&2; exit 2; }
+
+log() {
+    [ "$QUIET" -eq 1 ] && return 0
+    echo "[$(date -u +%FT%TZ)] $*"
+}
+
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  would run: $*"
+    else
+        "$@"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+gc-reload-orders — apply order/override config changes by performing a
+controlled supervisor cycle. Workaround for the binary bug where
+`gc supervisor reload` doesn't refresh the order-dispatch table.
+
+Usage:
+  gc-reload-orders [options]
+
+Options:
+  --skip-reload           Skip the pre-cycle `gc supervisor reload`.
+  --grace-seconds N       Wait up to N seconds for graceful stop before
+                          SIGKILL (default 15).
+  --port N                Supervisor port for verification (default 8372).
+  --plist-path PATH       Override plist path on Darwin (default
+                          ~/Library/LaunchAgents/com.gascity.supervisor.plist).
+  --dry-run               Show what would happen; touch nothing.
+  --quiet                 Suppress periodic status output.
+  -h, --help              Show this help.
+
+Examples:
+  gc-reload-orders                     # apply pending order/override changes
+  gc-reload-orders --dry-run           # preview without restarting
+  gc-reload-orders --skip-reload       # skip pre-cycle reload (cold path)
+  gc-reload-orders --grace-seconds 30  # be more patient with graceful stop
+
+This drops every agent across every rig served by this supervisor; treat
+it as a maintenance-window action. Active polecat worktrees + bead state
+survive; in-flight tmux sessions are torn down.
+
+See docs/known-binary-bugs.md "supervisor reload doesn't refresh order
+dispatch tables" for the bug context. See docs/diagnostic-runbook.md
+"Safe restart sequence" for the underlying recipe.
+EOF
+}
+
+# --- Argument parsing ---------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --quiet) QUIET=1; shift ;;
+        --skip-reload) SKIP_RELOAD=1; shift ;;
+        --grace-seconds)
+            shift
+            [ $# -gt 0 ] || die "--grace-seconds requires an argument"
+            STOP_GRACE_SECONDS="$1"; shift ;;
+        --grace-seconds=*) STOP_GRACE_SECONDS="${1#--grace-seconds=}"; shift ;;
+        --port)
+            shift
+            [ $# -gt 0 ] || die "--port requires an argument"
+            PORT="$1"; shift ;;
+        --port=*) PORT="${1#--port=}"; shift ;;
+        --plist-path)
+            shift
+            [ $# -gt 0 ] || die "--plist-path requires an argument"
+            PLIST_PATH_DEFAULT="$1"; shift ;;
+        --plist-path=*) PLIST_PATH_DEFAULT="${1#--plist-path=}"; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) die "unexpected positional arg: $1" ;;
+    esac
+done
+
+case "$STOP_GRACE_SECONDS" in
+    ''|*[!0-9]*) die "--grace-seconds must be a non-negative integer" ;;
+esac
+case "$PORT" in
+    ''|*[!0-9]*) die "--port must be a non-negative integer" ;;
+esac
+
+command -v gc >/dev/null 2>&1 || die "gc not found on PATH"
+
+PLATFORM="$(uname -s)"
+
+# --- Step 1: pre-cycle reload (cheap; warms config cache) ---------------
+
+if [ "$SKIP_RELOAD" -eq 0 ]; then
+    log "step 1/6: gc supervisor reload (warm config before cycle)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  would run: gc supervisor reload"
+    else
+        # reload is best-effort: if it fails or the supervisor is
+        # already stopped, we still proceed with the cycle. The cycle
+        # itself is what makes order changes take effect.
+        gc supervisor reload >/dev/null 2>&1 || \
+            log "  gc supervisor reload returned non-zero (proceeding with cycle anyway)"
+    fi
+else
+    log "step 1/6: skipping pre-cycle reload (--skip-reload)"
+fi
+
+# --- Step 2: capture supervisor PID -------------------------------------
+
+log "step 2/6: locating running supervisor process"
+SUPERVISOR_PID="$(pgrep -f 'gc supervisor run' 2>/dev/null | head -1 || true)"
+
+if [ -z "$SUPERVISOR_PID" ]; then
+    log "  no running supervisor found — cycle will reduce to bootstrap-only"
+else
+    log "  supervisor PID=$SUPERVISOR_PID"
+fi
+
+# --- Step 3: graceful stop with watch -----------------------------------
+
+if [ -n "$SUPERVISOR_PID" ]; then
+    log "step 3/6: gc supervisor stop (watching up to ${STOP_GRACE_SECONDS}s for exit)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  would run: gc supervisor stop"
+        echo "  would watch PID $SUPERVISOR_PID for up to ${STOP_GRACE_SECONDS}s"
+    else
+        gc supervisor stop >/dev/null 2>&1 || \
+            log "  gc supervisor stop returned non-zero (proceeding with kill watch)"
+        elapsed=0
+        while [ "$elapsed" -lt "$STOP_GRACE_SECONDS" ]; do
+            if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+                log "  graceful stop completed at ${elapsed}s"
+                SUPERVISOR_PID=""
+                break
+            fi
+            sleep 3
+            elapsed=$((elapsed + 3))
+        done
+    fi
+fi
+
+# --- Step 4: SIGKILL fallback for SIGTERM-ignore bug --------------------
+
+if [ -n "$SUPERVISOR_PID" ] && [ "$DRY_RUN" -eq 0 ]; then
+    if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+        log "step 4/6: graceful stop ignored after ${STOP_GRACE_SECONDS}s; sending SIGKILL"
+        kill -9 "$SUPERVISOR_PID" 2>/dev/null || true
+        sleep 3
+        if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+            die "supervisor PID $SUPERVISOR_PID did not exit even on SIGKILL — manual intervention required"
+        fi
+        log "  SIGKILL completed"
+    fi
+elif [ -n "$SUPERVISOR_PID" ] && [ "$DRY_RUN" -eq 1 ]; then
+    log "step 4/6: would SIGKILL PID $SUPERVISOR_PID if graceful stop ignored (dry-run)"
+else
+    log "step 4/6: skipping SIGKILL (already stopped)"
+fi
+
+# --- Step 5: verify (and re-bootstrap if drifted) -----------------------
+
+log "step 5/6: verifying supervisor is back up"
+case "$PLATFORM" in
+    Darwin)
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would check: launchctl list | grep com.gascity.supervisor"
+        else
+            # launchd's KeepAlive should respawn within a few seconds.
+            # Wait up to 10s for a numeric PID column.
+            new_pid=""
+            elapsed=0
+            while [ "$elapsed" -lt 10 ]; do
+                new_pid="$(launchctl list 2>/dev/null \
+                    | awk '/com\.gascity\.supervisor/ && $1 ~ /^[0-9]+$/{print $1; exit}' || true)"
+                [ -n "$new_pid" ] && break
+                sleep 2
+                elapsed=$((elapsed + 2))
+            done
+
+            if [ -z "$new_pid" ]; then
+                log "  launchd shows no running supervisor (PID column drifted to '-' or missing)"
+                log "  re-bootstrapping LaunchAgent"
+                launchctl bootout "gui/$(id -u)/com.gascity.supervisor" 2>/dev/null || true
+                if [ ! -f "$PLIST_PATH_DEFAULT" ]; then
+                    die "plist not found at $PLIST_PATH_DEFAULT — pass --plist-path or restore via gc-city-bootstrap"
+                fi
+                launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH_DEFAULT"
+                sleep 3
+                new_pid="$(launchctl list 2>/dev/null \
+                    | awk '/com\.gascity\.supervisor/ && $1 ~ /^[0-9]+$/{print $1; exit}' || true)"
+                [ -n "$new_pid" ] || die "re-bootstrap did not produce a running supervisor"
+            fi
+            log "  new supervisor PID=$new_pid"
+        fi
+        ;;
+    Linux)
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would check: systemctl --user is-active gc-supervisor"
+        elif command -v systemctl >/dev/null 2>&1; then
+            elapsed=0
+            while [ "$elapsed" -lt 10 ]; do
+                if systemctl --user is-active --quiet gc-supervisor 2>/dev/null; then
+                    break
+                fi
+                sleep 2
+                elapsed=$((elapsed + 2))
+            done
+            if ! systemctl --user is-active --quiet gc-supervisor 2>/dev/null; then
+                log "  systemd unit not active; attempting restart"
+                systemctl --user restart gc-supervisor || \
+                    die "systemctl --user restart gc-supervisor failed"
+            fi
+            log "  systemd unit gc-supervisor is active"
+        else
+            log "  systemctl not available — skip supervisor-up verification"
+        fi
+        ;;
+    *)
+        log "  unknown platform $PLATFORM — skipping launchd/systemd verification"
+        ;;
+esac
+
+# --- Step 6: confirm ----------------------------------------------------
+
+log "step 6/6: confirming supervisor is serving"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  would run: gc supervisor status"
+else
+    # Wait a short window for the new supervisor to bind its listen port
+    # before status will be informative.
+    elapsed=0
+    while [ "$elapsed" -lt 10 ]; do
+        if command -v lsof >/dev/null 2>&1; then
+            if lsof -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | grep -q .; then
+                break
+            fi
+        else
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    gc supervisor status || \
+        log "  gc supervisor status returned non-zero (supervisor may still be starting)"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo
+    echo "gc-reload-orders: dry-run complete. No supervisor cycle performed."
+else
+    echo
+    echo "gc-reload-orders: supervisor cycle complete."
+    echo
+    echo "Order changes are now live. Verify with:"
+    echo "  gc order list"
+    echo "  gc order check"
+    echo "  tail -f \$(dirname \"\$(which gc)\")/../var/log/supervisor.log    # if log path applies"
+    echo
+    echo "Note: gc-fix-watch may need a moment to re-apply gc-fix-* helpers"
+    echo "after the supervisor's pack-templater wipe on startup."
+fi

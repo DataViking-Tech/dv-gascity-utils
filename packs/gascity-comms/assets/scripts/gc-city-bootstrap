@@ -118,6 +118,7 @@ HELPERS=(
     "gc-fix-control-dispatcher"
     "gc-fix-watch"
     "gc-events-rotate"
+    "gc-reload-orders"
     "gc-rig-init"
     "gc-rig-join"
     "gc-warm-rig-pool"

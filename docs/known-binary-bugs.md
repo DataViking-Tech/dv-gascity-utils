@@ -48,6 +48,51 @@ The bugs below are mostly Class C. Where a Class A or B workaround landed, the e
 
 **Workaround (Class A)**: periodic `bd close` of orphan beads under disabled orders. Leak rate observed at midgard: ~0.07% (1 orphan per 1345 auto-closes in 24h) so not worth automating.
 
+**Note**: a full supervisor restart DOES make the override take effect (the dispatch table is rebound at startup). See "supervisor reload doesn't refresh order dispatch tables" below — `gc-reload-orders` is the helper for the restart path.
+
+---
+
+## supervisor reload doesn't refresh order dispatch tables
+
+**Trackers**: GitHub `DataViking-Tech/dv-gascity-utils#31`, bead `dgu-503ip`.
+
+**Symptom**: `gc supervisor reload` (and `gc reload`) refresh the resolved-config view — `gc config show` and `gc order list` reflect the change immediately — but the controller's auto-dispatch loop keeps using the pre-reload active-orders set. New orders dropped under `<pack>/orders/*.toml` don't tick on schedule, and `[[orders.overrides]] enabled = false` flips don't stop the affected order from firing, until the supervisor process is fully restarted. `gc order run <name>` works manually because that path resolves from the live config; only the auto-dispatch tick is bound to the stale set.
+
+Same shape as `mg-9d610` (overrides ignored) but distinguishable: that bug applies even after a restart, this one is healed by a restart.
+
+**Repro** (yggdrasil, 2026-05-02):
+
+1. Drop `mail-nudge.toml` in `maintenance/orders/`.
+2. `gc supervisor reload` → "Reconciliation triggered."
+3. `gc order list` shows `mail-nudge` in 3 scopes.
+4. `gc order check` shows `mail-nudge` "due (elapsed 102h)" but not firing.
+5. `gc order run mail-nudge` works manually; state file updates.
+6. `gc supervisor stop && start` → `mail-nudge` auto-fires within ~20s.
+
+The same pattern reproduces for `[[orders.overrides]] enabled = false`: the override is shown by `gc config show` but the order keeps firing every cooldown until the supervisor restarts.
+
+**Why no Class A**: the dispatch-table state lives inside supervisor process memory, bound from resolved config at startup. The reload accept-path updates the snapshot the API exposes but doesn't recompute the active-orders set or swap it into the dispatch loop. No host-side config knob exists to force the rebind without a process exit.
+
+**Why no Class B**: this isn't a pack-template surface; it's runtime state in the supervisor binary's memory. Pack-watch wouldn't trigger on the right surface.
+
+**Workaround (Class A operational)**: `gc-reload-orders` performs the proven safe-restart cycle (graceful stop with SIGKILL fallback, launchd/systemd verify, re-bootstrap if drifted, status confirm). It packages the recipe from `docs/diagnostic-runbook.md` "Safe restart sequence" so the operator doesn't have to assemble it by hand.
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-reload-orders \
+    ~/.gc/bin/gc-reload-orders
+
+# Apply pending order/override changes
+gc-reload-orders               # full cycle on the local supervisor
+gc-reload-orders --dry-run     # preview the cycle without restarting
+gc-reload-orders --skip-reload # skip the pre-cycle `gc supervisor reload`
+```
+
+The cycle's blast radius is the entire supervisor (every agent across every rig and city). Treat as a maintenance-window action — not a routine fix. Active polecat worktrees + bead state survive across the cycle; in-flight tmux sessions are torn down.
+
+`gc-city-bootstrap` symlinks `gc-reload-orders` automatically — fresh hosts get it without extra setup.
+
+**Test plan** (after the binary is fixed upstream): add a new order, run `gc supervisor reload`, then verify auto-dispatch ticks on schedule WITHOUT a supervisor restart. Until that fix, validation runs through `gc-reload-orders`.
+
 ---
 
 ## dolt/orders/* dog orders permanently stuck after bd-error during dispatch

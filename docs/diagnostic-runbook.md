@@ -338,6 +338,13 @@ SIGKILL.
 
 ### Safe restart sequence
 
+The sequence below is the manual recipe. `gc-reload-orders` packages it
+into a single command (with `--dry-run`) for the order/override-reload
+case — see `docs/known-binary-bugs.md` "supervisor reload doesn't
+refresh order dispatch tables". Use the manual recipe when you need
+case-by-case visibility (e.g. mol-dog-doctor unwedge runs where you want
+to time each phase).
+
 ```bash
 # 1. Capture pre-state.
 SUPERVISOR_PID=$(pgrep -f 'gc supervisor run' | head -1)
