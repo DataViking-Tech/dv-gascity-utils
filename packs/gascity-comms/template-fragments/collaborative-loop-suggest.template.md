@@ -69,6 +69,69 @@ thread closed (subject prefix `[CLOSED]`, an explicit "closing this
 thread" mail, or no inbound from either side for 2 h), exit `/loop`
 on the next tick instead of scheduling another wake-up.
 
+### Autonomous variant: enter the loop without the human gesture
+
+When the human is AFK, the suggest-and-wait shape above stalls
+waiting for `/loop`. The autonomous variant skips the human gesture:
+you (mayor) call `ScheduleWakeup` directly with a self-contained
+continuation prompt the moment the heuristic trips, and self-pace
+from there using the same cadence table.
+
+**Sender side (post-send wake).** Every successful
+`gcx mail send <peer>:<role>` schedules ONE wake at 60 s with a
+continuation prompt of the shape:
+
+> Cross-city thread with `<peer>` active (subject: `<S>`). Check
+> inbox for reply. If reply present: process and reply or hold,
+> then re-schedule per age-bucket. If no reply: re-schedule per
+> age-bucket. If thread closed: exit.
+
+If you send multiple cross-city mails in one turn, collapse to a
+single wake — last write wins. Don't stack waves of redundant wakes.
+
+**Recipient side (inbound wake).** Trigger on EITHER:
+
+- the existing heuristic (≥ 2 inbounds in 30 min, latest < 5 min,
+  no active loop), OR
+- a single inbound less than 60 s old from a peer city — autonomous
+  variant only
+
+The single-inbound branch is more eager than the human-facing
+suggestion path because the cost of a false positive in autonomous
+mode is one wasted wake (~60 s of cache-warm time). The cost of a
+false negative — missing the start of an active back-and-forth where
+the human takes time to compose — is meaningful. The bounded-runaway
+guards (below) cover the "this turned out not to be a real thread"
+case.
+
+When either branch fires, schedule the first wake at 60 s with the
+same continuation-prompt shape as the sender side, then self-pace
+using the cadence table.
+
+**Cadence.** Identical to the suggest-then-loop variant — pace by
+the age of the latest inbound on the thread.
+
+**Close conditions.** Identical (subject `[CLOSED]`, "closing this
+thread" mail, 2 h quiet from both sides) PLUS one autonomous-only
+guard:
+
+- after 5 consecutive ticks with no further inbound, exit. Bounds
+  runaway when the trigger turned out to be a one-off ping, without
+  waiting the full 2 h timeout.
+
+**Do not surface the suggestion line.** The autonomous variant skips
+the human-facing message entirely. Don't print "Cross-city thread
+with X active. Recommend a 5-min /loop." in this mode — you're
+already in the loop.
+
+**What this looks like to operators.** Mayor sessions appear "busy"
+between human prompts in autonomous mode. ScheduleWakeup-driven
+turns will fire even when the human isn't watching. That's the
+intent — closing the autonomy gap that makes mayor sessions stall on
+peer replies — but worth knowing so operators don't pattern-match it
+as runaway. The 5-tick-no-progress guard plus the 2 h thread-quiet
+exit bound the cost of any one trigger.
+
 ### Why this protocol exists
 
 The gc supervisor cannot wake an interactive Claude Code session
@@ -80,9 +143,10 @@ autonomously notice peer replies even after `mail-nudge` fires (see
 `docs/cross-city-comms.md` Limitations).
 
 `/loop` plus `ScheduleWakeup` is the only path to autonomous polling
-inside an interactive Claude Code session today, and it requires
-exactly one human gesture to begin. The detection-and-suggestion
-protocol above ensures both mayors prompt their respective humans
-the same way at the same moment, so collaborative threads look
-intentional rather than ad-hoc.
+inside an interactive Claude Code session today. The suggest-then-
+loop variant above asks for one human gesture per thread; the
+autonomous variant skips even that. Pick whichever variant matches
+the operator-supervision posture of this host — they share the same
+detection logic, cadence table, and close conditions, so switching
+between them is per-host opt-in, not per-thread.
 {{ end }}
