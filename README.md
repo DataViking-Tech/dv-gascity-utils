@@ -6,7 +6,7 @@ DataViking-Tech utilities and patterns for [Gas City](https://docs.gascityhall.c
 
 ### Packs
 
-- **`packs/gascity-comms/`** — cross-city mail tooling. Ships `gcx` (city-aware mail wrapper), the `mail-nudge` order (auto-wakes recipient sessions when their inbox grows), `gc-rig-join` (joins an existing shared-prefix rig from a second city — see `docs/shared-rig-prefix.md`), `gc-audit-alias-mismatch` + `gc-fix-alias-mismatch` (find and rewrite short-form agent aliases to canonical `<rig>/gastown.<role>` across installed system packs; idempotent — see `docs/alias-canonicalization.md`; supersedes the narrower `gc-fix-refinery-routing`, preserved as a deprecation shim), a doctor check (`doctor/check-alias-mismatch`) that surfaces drift, `gc-fix-merge-strategy` (one-shot: makes the polecat done-sequence auto-detect PR-protected branches and set `metadata.merge_strategy=mr` so the refinery opens a PR instead of failing GH013 on direct merge — see `docs/rig-merge-strategy.md`), a peers.toml template, the `collaborative-loop-suggest` mayor-prompt template fragment (see `docs/collaborative-loops.md`), and the `cross-city-prime` template fragment (orients freshly-restarted mayor sessions to the cross-city setup — see `docs/mayor-prompt-prime-recipe.md`). Importable into any Gas City workspace.
+- **`packs/gascity-comms/`** — cross-city mail tooling. Ships `gcx` (city-aware mail wrapper), the `mail-nudge` order (auto-wakes recipient sessions when their inbox grows), `gc-rig-join` (joins an existing shared-prefix rig from a second city — see `docs/shared-rig-prefix.md`), `gc-audit-alias-mismatch` + `gc-fix-alias-mismatch` (find and rewrite short-form agent aliases to canonical `<rig>/gastown.<role>` across installed system packs; idempotent — see `docs/alias-canonicalization.md`; supersedes the narrower `gc-fix-refinery-routing`, preserved as a deprecation shim), a doctor check (`doctor/check-alias-mismatch`) that surfaces drift, `doctor/check-cross-city-prime-wiring` (warns when the pack is imported but the host hasn't completed the per-host opt-in to wire `cross-city-prime` into the mayor template — see `docs/mayor-prompt-prime-recipe.md`), `doctor/check-bin-symlinks` (walks `~/.gc/bin/` and fails on broken helper symlinks; flags out-of-tree targets informationally — catches the case where a symlink target is moved or deleted out from under it without `gc-city-bootstrap` being re-run), `gc-fix-merge-strategy` (one-shot: makes the polecat done-sequence auto-detect PR-protected branches and set `metadata.merge_strategy=mr` so the refinery opens a PR instead of failing GH013 on direct merge — see `docs/rig-merge-strategy.md`), a peers.toml template, the `collaborative-loop-suggest` mayor-prompt template fragment (see `docs/collaborative-loops.md`), and the `cross-city-prime` template fragment (orients freshly-restarted mayor sessions to the cross-city setup — see `docs/mayor-prompt-prime-recipe.md`). Importable into any Gas City workspace.
 
 ### Docs
 
@@ -17,7 +17,9 @@ DataViking-Tech utilities and patterns for [Gas City](https://docs.gascityhall.c
 - **`docs/shared-rig-prefix.md`** — open design problem: how do multiple cities work on the same logical rig (same dolt prefix, same beads pool, polecats from any host) instead of each city auto-creating its own duplicate.
 - **`docs/alias-canonicalization.md`** — why `<rig>/gastown.<role>` is the canonical agent alias form, how short-form leaks cause silent routing failures, and the `gc-audit-alias-mismatch` / `gc-fix-alias-mismatch` workflow.
 - **`docs/rig-merge-strategy.md`** — how the polecat picks `direct` vs `mr` merge mode at submit time, the resolution order (existing metadata > per-rig override file > auto-detect via GitHub branches API > fallback `direct`), and how to install the `gc-fix-merge-strategy` patch helper.
-- **`docs/collaborative-loops.md`** — protocol for collaborative `/loop`s between mayors on different cities: the structural autonomy gap that motivates it, the active-thread heuristic, the in-band suggestion shape, the `ScheduleWakeup` cadence table, three opt-in mechanisms (cleanest first), AND an autonomous variant (post-send + single-inbound triggers, no human gesture, 5-tick-no-progress guard) for hosts where the human is expected to be AFK during cross-city collaboration. Pairs with the `collaborative-loop-suggest` template fragment.
+- **`docs/refinery-pr-body.md`** — what shape the refinery's `mr`-strategy PR body takes after the patch (Closes #N, GitHub issue link, work-bead ID, commit log, blockquoted issue context, test-plan checklist), where the heredoc lives in `mol-refinery-patrol.toml`, and the path to a `gc-fix-refinery-pr-body` helper if a re-import ever reverts the formula.
+- **`docs/cross-city-prime-wiring-gap.md`** — host-local prime: the inline pattern (and why). Documents that `[[patches.agent]]` for the mayor agent at workspace scope is silently dropped by current gc binaries, and codifies the supported path: inline the host-specific block directly inside the override mayor template at the recipe's insertion point — no separate `prime.local.md`, no `{{ template "local-prime" }}` indirection, no agent patch. Includes per-host snapshot.
+- **`docs/collaborative-loops.md`** — protocol for collaborative `/loop`s between mayors on different cities: the structural autonomy gap that motivates it, the active-thread heuristic, the in-band suggestion shape, the `ScheduleWakeup` cadence table, and three opt-in mechanisms (cleanest first). Pairs with the `collaborative-loop-suggest` template fragment.
 - **`docs/agent-scaling.md`** — schema-valid recipe for overriding scaling fields (`min_active_sessions`, `max_active_sessions`, `idle_timeout`, …) on rig-scoped agents (witness/refinery/polecat) via `[[rigs.overrides]]` in `city.toml`. The right knob for keeping one polecat warm per rig.
 - **`docs/host-prime-stub.md`** — convention for the per-host `local-prime` template stub that complements the city-agnostic `cross-city-prime` fragment.
 - **`docs/mayor-prompt-prime-recipe.md`** — opt-in recipe for hosts to override their mayor prompt template so freshly-restarted mayors come up oriented to the cross-city setup.
@@ -70,8 +72,8 @@ Per-host symlinks the bootstrap script handles automatically:
 
 ```bash
 for h in gcx gc-rig-join gc-audit-alias-mismatch gc-fix-alias-mismatch \
-         gc-fix-refinery-routing gc-fix-merge-strategy gc-fix-watch \
-         gc-warm-rig-pool gc-tune-refinery-loop gc-city-bootstrap; do
+         gc-fix-refinery-routing gc-fix-merge-strategy gc-fix-refinery-pr-body \
+         gc-fix-watch gc-warm-rig-pool gc-tune-refinery-loop gc-city-bootstrap; do
     ln -sf "$HOME/dv-gascity-utils/packs/gascity-comms/assets/scripts/$h" "$HOME/.gc/bin/$h"
 done
 cp ~/dv-gascity-utils/packs/gascity-comms/assets/templates/peers.toml.template ~/.gc/peers.toml
@@ -86,9 +88,10 @@ fixes:
 ```bash
 gc-fix-alias-mismatch ~/<town>     # or just `gc-fix-alias-mismatch` to scan ~/*
 gc-fix-merge-strategy ~/<town>
+gc-fix-refinery-pr-body ~/<town>
 ```
 
-Both are idempotent — re-runs report `already fixed`. See
+All three are idempotent — re-runs report `already fixed`. See
 `docs/alias-canonicalization.md` and `docs/rig-merge-strategy.md` for
 what each one rewrites and why.
 
