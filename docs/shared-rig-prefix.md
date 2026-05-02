@@ -284,6 +284,81 @@ Verdict per key:
 
 The two misplaced keys (`clone_id`, `last_import_time`) are upstream `bd` schema bugs, not gc bugs. Filed as follow-up — see "Open questions" below.
 
+## Auto-detect at rig-init time (2026-05-02)
+
+`gc-rig-init` now scans the shared dolt server for an existing
+database tracking the same GitHub repo before invoking `gc rig add`.
+If the rig being created has a `git remote get-url origin` that points
+at a `github.com/<owner>/<repo>` slug already recorded as
+`metadata.github_repo` in some other database, the helper halts with a
+clear message pointing operators at `gc-rig-join` instead — preventing
+the accidental duplicate-DB scenario this doc describes.
+
+The join key is the rig's GitHub slug, written to the rig's dolt
+database as a `metadata.github_repo` row in the canonical
+`owner/repo` form (no scheme, no trailing `.git`). Both `https://`
+and `git@` clone URL flavors normalize to the same slug, so two cities
+cloning the same repo through different mechanisms still match.
+
+### Pre-create check flow
+
+When `gc-rig-init <rig-path>` runs:
+
+1. Resolve the rig's origin URL (`git -C <path> remote get-url origin`).
+2. Normalize to `owner/repo`.
+3. `SHOW DATABASES` on the local dolt server, skip system + probe
+   databases.
+4. For each remaining database, `SELECT value FROM <db>.metadata WHERE
+   key='github_repo' LIMIT 1`.
+5. If any match: print HALT message naming the existing database +
+   pointing at `gc-rig-join`, exit 3.
+6. If no match: continue with the normal create flow.
+
+Skipped when the rig has no GitHub origin remote (local-only repos),
+when the dolt CLI isn't on PATH, or when the operator passes
+`--no-multi-city-check` (rare; e.g., intentionally reserving a fork
+as a distinct project).
+
+### Post-create write
+
+After the normal create flow completes (steps 1–4 of `gc-rig-init`,
+including `bd init`), step 5 writes the `metadata.github_repo` row to
+the new database. This is the join key step 0 reads on the next run
+anywhere — yg, mg, asgard, any future host.
+
+### Backfill mode
+
+Existing rigs created before the metadata convention won't have the
+`github_repo` row, so step 0 won't catch duplicates of them. Run
+
+```bash
+gc-rig-init --backfill-github-repo
+```
+
+once per host, post-deploy of this updated helper, to walk every rig
+in the city, read its origin, and write the `github_repo` row to its
+database. Idempotent: re-running on already-backfilled rigs reports
+`ok (already set)` without writing.
+
+The backfill uses the same canonical-slug derivation as the create
+path, so a backfilled `sp` database (synth-panel on yg) and a fresh
+`gc-rig-init` of the same SynthPanel checkout on mg both compute
+`DataViking-Tech/SynthPanel` and trigger the duplicate halt
+correctly.
+
+### Coordination across cities
+
+The `metadata.github_repo` row lives in the rig's dolt database,
+which is shared across cities (yg + mg + asgard all read the same
+dolt server). Backfilling on yg makes the row visible to mg
+immediately; mg doesn't need to backfill its own rigs unless it owns
+rigs yg doesn't. (Today, the rig set is yg-side; the backfill there
+is sufficient to cover existing repos.)
+
+When mg later runs `gc-rig-init` for a repo yg already initialized,
+step 0 reads yg's `metadata.github_repo` row out of the shared dolt
+and halts with the join instructions.
+
 ## Verified working — single-host primitives (2026-04-28)
 
 Re-verified against the live `sp` database on `127.0.0.1:16022`:
