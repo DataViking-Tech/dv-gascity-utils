@@ -466,6 +466,63 @@ ALL subsequent edits to `city.toml` (`[[orders.overrides]] enabled = false`, new
 
 ---
 
+## gc bd update from outside rig dir misses freshly-created cross-rig beads
+
+**Trackers**: GitHub `DataViking-Tech/dv-gascity-utils#27`, bead `dgu-hmbou`.
+
+**Symptom**: `gc bd update <id>` (and other id-bearing `bd` subcommands) from a working directory outside the bead's owning rig fails with `Error resolving <id>: no issue found matching "<id>"`, even when the bead is fully present in shared dolt and visible to `gc bd list --rig <name>`. Passing `--rig <name>` explicitly works around it. The issue is a stale routing cache between bead creation and the next read — the `bd update` resolver consults the local prefix→rig cache, which doesn't yet include the new prefix mapping.
+
+**Repro** (midgard, 2026-05-02, from mayor home outside any rig):
+
+```bash
+$ gc bd create --rig dv-gascity-utils --title "..." --type=task --priority=2
+✓ Created issue: dgu-al90e — ...
+
+$ # Direct dolt query confirms presence:
+$ echo "SELECT id FROM dgu.issues WHERE id='dgu-al90e'" | gc dolt sql
+| dgu-al90e |
+
+$ # bd list --rig works:
+$ gc bd list --rig dv-gascity-utils --status=open --limit 5
+○ dgu-al90e  ...
+
+$ # But bd update without --rig fails:
+$ gc bd update dgu-al90e --set-metadata gc.routed_to=...
+Error resolving dgu-al90e: no issue found matching "dgu-al90e"
+
+$ # Adding --rig works:
+$ gc bd update dgu-al90e --rig dv-gascity-utils --set-metadata gc.routed_to=...
+✓ Updated issue: dgu-al90e
+```
+
+Several seconds elapsed between create and the failing update — not a write-visibility race; the resolver's cache misses the new prefix mapping.
+
+**Why this matters**: slinging a freshly-created bead to a polecat pool is a two-step CLI flow — `bd create --rig <r>` then `bd update <id> --set-metadata gc.routed_to=...`. The second step needs the rig name even though the prefix on the id already pins the rig. Every dispatch script needs to know rig names, not just prefixes — an awkward surface for orchestration layers (mayors, slings, automation).
+
+**Why no Class A**: the cache lives inside the gc binary's resolver path. No config knob forces a cache rebuild after `bd create`.
+
+**Why no Class B**: not a pack-template surface; resolver state is gc binary memory.
+
+**Workaround (Class A operational)**: `gc-bd` wrapper auto-derives `--rig <name>` from the bead-id prefix and injects it before exec'ing `gc bd ...`. Drop-in for `gc bd` on every id-bearing subcommand (`update`, `show`, `close`, `reopen`, `comment`, `note`, `edit`, `assign`, `priority`, `set-state`, `label`, `link`, `delete`, `promote`, `children`). Falls through unchanged if `--rig` is already passed, the id has no recognizable prefix, the prefix doesn't match a known rig, or the matched rig is the HQ rig (gc resolves HQ beads via the default path; `gc --rig <hq-name>` is rejected).
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-bd \
+    ~/.gc/bin/gc-bd
+
+# Use exactly like `gc bd`:
+gc-bd update dgu-al90e --set-metadata gc.routed_to=dv-gascity-utils/polecat
+gc-bd show dgu-al90e
+gc-bd close dgu-al90e
+```
+
+`gc-city-bootstrap` symlinks `gc-bd` automatically — fresh hosts get it without extra setup.
+
+Use it in dispatch scripts and from mayor sessions where the bead being updated may live in a rig other than the caller's cwd. Direct `gc bd ...` continues to work for id-less subcommands (`bd list`, `bd ready`, `bd stats`) and from inside the bead's owning rig dir.
+
+**Test plan** (after the binary is fixed upstream): from a working dir outside any rig, run `gc bd create --rig <r> --title ...` followed immediately by `gc bd update <id> --set-metadata k=v` WITHOUT `--rig` and confirm the update succeeds. Until that fix lands, validation runs through `gc-bd`.
+
+---
+
 ## How to add a new entry
 
 1. Reproduce on at least one host. Capture exact error strings + binary version.
