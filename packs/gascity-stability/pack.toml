@@ -33,6 +33,13 @@
 #     refinery pool that haven't been picked up within the ramp
 #     threshold. Catches the pool-spawn delay where the gate-sweep
 #     fires but pool reconcile hangs further down.
+#   - doctor/check-bd-throughput — for each rig, creates a canary
+#     bead via `bd q`, times the create, then closes it. Fails when
+#     a write exceeds the throughput threshold (default 5s) or wedges
+#     past the hard cap (default 30s). Catches the bd auto-backup
+#     hook chain wedge — where every bd write hangs 30s+ on a failing
+#     mkdir. See dv-gascity-utils/docs/known-binary-bugs.md
+#     'bd auto-backup hook tries to mkdir the user's home dir'.
 #
 # Importable into any Gas City workspace:
 #

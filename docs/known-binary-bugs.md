@@ -392,11 +392,11 @@ The hook is trying to `mkdir /Users/<user>` (the user's home directory) instead 
 
 **Evidence**: the dolt row update completes in ~50ms (verifiable via direct `gc dolt sql` query). The remaining ~30-120s is the hook chain timing out. `pkill -f "bd update"` is the fastest recovery; you'll see 4 child processes per stuck bd command (the hook chain).
 
-**Class**: C — bd binary bug. The hook isn't toggleable through any documented config.
+**Class**: C — bd binary bug. The hook isn't toggleable through any documented config (`bd config set backup.enabled false` is shadowed by an auto-enable when a git remote is detected — see `bd backup status` output: `enabled=true (auto: git remote detected)` despite `backup.enabled=false` in the explicit config).
 
 **Workaround**: none clean. Mitigation: when slinging multiple beads, do them sequentially (don't fire 3 in parallel — they all fight the same failing mkdir and the throughput is the same). Verify writes via direct dolt query (`echo "SELECT id, ... FROM <rig>.issues WHERE id='<bead>'" | gc dolt sql`) rather than waiting for `bd update` to return.
 
-**Detection**: a dedicated `bd-throughput` doctor check (run a synthetic bd update + time it; fail if >5s) would be the targeted detector if this stays unfixed.
+**Detection**: `gascity-stability/doctor/check-bd-throughput` (this repo). For each rig, creates a canary bead via `bd q`, times the create, then closes the bead. Fails on `>BD_THROUGHPUT_THRESHOLD_SEC` (default 5s) or wedge past `BD_THROUGHPUT_HARD_CAP_SEC` (default 30s, kills the process group so the hook chain dies). Run as part of `gc doctor`.
 
 ---
 
