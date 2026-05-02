@@ -21,6 +21,18 @@
 
 set -euo pipefail
 
+# Source ~/.gc/secrets.env if present so GC_DOLT_USER / GC_DOLT_PASSWORD become
+# the defaults for the preflight dolt calls. Matches `gc`'s own discovery path
+# (every `gc dolt sql` call already honors these vars). Without this, the raw
+# `dolt` invocations below cannot reach an authenticated shared server.
+GC_HOME="${GC_HOME:-$HOME/.gc}"
+if [ -f "$GC_HOME/secrets.env" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$GC_HOME/secrets.env"
+    set +a
+fi
+
 usage() {
     cat <<'EOF'
 gc-rig-join — join an existing shared-prefix rig from a second city.
@@ -35,7 +47,10 @@ Options:
   --name <name>          Rig name in the second city's site.toml (default: derived from path)
   --host <host>          Shared dolt host (default: 127.0.0.1)
   --port <port>          Shared dolt port (default: 16022)
-  --user <user>          Shared dolt user (default: root)
+  --user <user>          Shared dolt user (default: $GC_DOLT_USER or root)
+  --password <pw>        Shared dolt password (default: $GC_DOLT_PASSWORD,
+                         else $DOLT_CLI_PASSWORD, else $MYSQL_PWD, else empty)
+  --password-file <path> Read password from first line of file (overrides env)
   --pin-endpoint         After --adopt, also run `gc rig set-endpoint <name> --external …`
                          (use when the city's own dolt is NOT the shared one)
   --dry-run              Show what would be done; touch nothing
@@ -43,6 +58,11 @@ Options:
 
 The local-path is the directory holding the project's git clone on this host.
 It must already exist (you cloned the repo). This script creates `.beads/` inside it.
+
+Auth: ~/.gc/secrets.env is sourced if present (GC_DOLT_USER, GC_DOLT_PASSWORD).
+The hot-path operations (`gc dolt-state ensure-project-id`, `gc rig add --adopt`)
+already honor those vars via the `gc` binary; the preflight dolt calls below
+now do too. Override per-invocation with --user / --password / --password-file.
 
 Examples:
   # Second city joining `sp` (synth-panel) where the city already use-externals
@@ -66,7 +86,10 @@ PREFIX=""
 NAME=""
 HOST="127.0.0.1"
 PORT="16022"
-USER_="root"
+USER_="${GC_DOLT_USER:-root}"
+PASSWORD_FLAG=""
+PASSWORD_FILE=""
+PASSWORD_FROM_FLAG=0
 PIN_ENDPOINT=0
 DRY_RUN=0
 
@@ -103,6 +126,8 @@ while [ $# -gt 0 ]; do
         --host) HOST="${2:-}"; shift 2 ;;
         --port) PORT="${2:-}"; shift 2 ;;
         --user) USER_="${2:-}"; shift 2 ;;
+        --password) PASSWORD_FLAG="${2:-}"; PASSWORD_FROM_FLAG=1; shift 2 ;;
+        --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
         --pin-endpoint) PIN_ENDPOINT=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --) shift; break ;;
@@ -115,6 +140,26 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Resolve the dolt password used by the preflight dolt calls below.
+# Precedence: --password-file > --password > $GC_DOLT_PASSWORD >
+#             $DOLT_CLI_PASSWORD > $MYSQL_PWD > empty.
+# The `dolt` CLI honors DOLT_CLI_PASSWORD (we export it on each invocation),
+# so this resolution feeds that env var.
+if [ -n "$PASSWORD_FILE" ]; then
+    [ -r "$PASSWORD_FILE" ] || die "--password-file is not readable: $PASSWORD_FILE"
+    PASSWORD=$(head -n1 "$PASSWORD_FILE")
+elif [ "$PASSWORD_FROM_FLAG" -eq 1 ]; then
+    PASSWORD="$PASSWORD_FLAG"
+elif [ -n "${GC_DOLT_PASSWORD:-}" ]; then
+    PASSWORD="$GC_DOLT_PASSWORD"
+elif [ -n "${DOLT_CLI_PASSWORD:-}" ]; then
+    PASSWORD="$DOLT_CLI_PASSWORD"
+elif [ -n "${MYSQL_PWD:-}" ]; then
+    PASSWORD="$MYSQL_PWD"
+else
+    PASSWORD=""
+fi
 
 [ -n "$LOCAL" ]  || { usage >&2; exit 2; }
 [ -n "$PREFIX" ] || die "--prefix is required"
@@ -155,7 +200,8 @@ fi
 # Without this we'd fall through to ensure-project-id and surface a generic
 # "Error 1049 (HY000): database not found" — confusing for first-time joiners.
 if command -v dolt >/dev/null 2>&1; then
-    DBS_OUT=$(dolt --no-tls --user "$USER_" --password "" \
+    DBS_OUT=$(DOLT_CLI_PASSWORD="$PASSWORD" \
+              dolt --no-tls --user "$USER_" \
                    --host "$HOST" --port "$PORT" \
                    sql --query "SHOW DATABASES;" --result-format=csv 2>&1) || {
         die "cannot reach dolt server at $HOST:$PORT (user=$USER_): $(echo "$DBS_OUT" | head -1)"
@@ -169,7 +215,8 @@ if command -v dolt >/dev/null 2>&1; then
     # If the DB exists but is empty (someone created it manually for some other
     # purpose), `gc rig add --adopt` would happily wire us in and `bd list` would
     # then explode at first read. Catch it here.
-    TBLS=$(dolt --no-tls --user "$USER_" --password "" \
+    TBLS=$(DOLT_CLI_PASSWORD="$PASSWORD" \
+           dolt --no-tls --user "$USER_" \
                 --host "$HOST" --port "$PORT" \
                 sql --query "USE \`$PREFIX\`; SHOW TABLES;" --result-format=csv 2>&1) || {
         die "cannot enumerate tables in database '$PREFIX' on $HOST:$PORT: $(echo "$TBLS" | head -1)"
