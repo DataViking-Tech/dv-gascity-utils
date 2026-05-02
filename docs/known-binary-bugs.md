@@ -361,6 +361,35 @@ The wrapper:
 
 ---
 
+## controller's per-rig `bd init` step doesn't honor secrets.env
+
+**Trackers**: `dgu-emwy6` (open). Upstream: [DataViking-Tech/dv-gascity-utils#29](https://github.com/DataViking-Tech/dv-gascity-utils/issues/29). Same root-cause family as #26 (`gc-rig-join` preflight) and the `DOLT_CLI_PASSWORD=""` pattern in `gc-rig-init` — three surfaces, one bug.
+
+**Symptom**: supervisor's per-rig `init rig <name> beads: exec beads init` step defaults to `dolt --user root --password ""` against the configured shared dolt. On hosts whose shared dolt requires auth (mg's `GC_DOLT_USER=beads` + `GC_DOLT_PASSWORD=…` in `~/.gc/secrets.env`), the bd init call hangs and gets SIGKILL'd by the supervisor's init timeout. The per-rig init then falls into a backoff retry loop and the entire city stays stuck never coming up. Cascades: subsequent reload requests get rejected ("keeping old config"), so any city.toml edits made after init failure are silently dropped.
+
+**Evidence**: mg, 2026-05-02:
+```
+gc supervisor: city 'midgard': init: beads lifecycle: init rig "dv-gascity-utils" beads:
+  exec beads init: signal: killed (skipping)
+gc supervisor: city 'midgard': init failure #3, next retry in 40s
+```
+
+**Root cause**: `gc-beads-bd.sh` (the bd-pack wrapper the supervisor execs) reads `${GC_DOLT_PASSWORD:-}` from its own environment. The supervisor doesn't pre-source `~/.gc/secrets.env`, so the var is unset. The wrapper's `bd init` invocation also doesn't pass `--server-user` / `BEADS_DOLT_PASSWORD`, so even if the env had been populated, bd would still default to root/empty.
+
+**Workaround (Class B)**: `gc-fix-bd-init-auth` patches the runtime `<city>/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh` to (a) source `~/.gc/secrets.env` early, with MYSQL_PWD ↔ GC_DOLT_PASSWORD bridging, and (b) pass `--server-user "$DOLT_USER"` + `BEADS_DOLT_PASSWORD="$DOLT_PASSWORD"` to the `bd init` call. Idempotent via marker checks.
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-fix-bd-init-auth \
+    ~/.gc/bin/gc-fix-bd-init-auth
+
+gc-fix-bd-init-auth --dry-run    # preview
+gc-fix-bd-init-auth              # apply across all towns under $HOME
+```
+
+`gc-fix-watch` re-applies after every supervisor templater wipe. On hosts without secrets.env (yg, asgard) the bootstrap block is a no-op — DOLT_USER stays `root` and DOLT_PASSWORD stays empty, matching pre-patch behavior.
+
+---
+
 ## Pack-template wipe on supervisor startup / heavy reconcile
 
 **Trackers**: discussed across `mg-d80k3`, `mg-ovjgn`, `mg-pfh96` threads. No primary bead — it's the underlying mechanism that creates Class B's reason-for-existing.
