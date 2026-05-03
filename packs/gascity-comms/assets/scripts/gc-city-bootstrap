@@ -117,6 +117,7 @@ HELPERS=(
     "gc-fix-runtime-restart"
     "gc-fix-control-dispatcher"
     "gc-fix-bd-init-auth"
+    "gc-fix-inherited-city-resolution"
     "gc-fix-watch"
     "gc-events-rotate"
     "gc-reload-orders"

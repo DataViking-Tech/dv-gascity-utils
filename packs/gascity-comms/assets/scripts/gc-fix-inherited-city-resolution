@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# gc-fix-inherited-city-resolution — backfill dolt.host/port into rig
+# .beads/config.yaml so the supervisor's "inherited_city" validation
+# stops failing on adopted rigs.
+#
+# WHY:
+#   When a rig's `.beads/config.yaml` has `gc.endpoint_origin: inherited_city`,
+#   the field name implies the supervisor should inherit `dolt.host`/`dolt.port`
+#   from the parent city's `city.toml [dolt]` block. It does not. The
+#   supervisor's bead-store init validator requires both keys to be present
+#   in the rig's `.beads/config.yaml` itself and otherwise refuses the rig:
+#
+#     gc supervisor: city '<name>': init: beads lifecycle:
+#       invalid canonical rig endpoint state in <rig>/.beads/config.yaml:
+#       canonical inherited rig config requires both dolt.host and dolt.port (skipping)
+#
+#   This bites two paths:
+#     1. `gc rig add --adopt` writes config.yaml without dolt.host/port
+#        (because the values are inherited at the gc-CLI layer). The
+#        supervisor then refuses the rig at next reload.
+#     2. Pre-staged stubs shipped via gc-rig-join + gc dolt-state ensure-project-id
+#        also start without explicit host/port.
+#
+#   This is a Class C binary bug in gc 1.0.0; tracking
+#   DataViking-Tech/dv-gascity-utils#30 / dgu-kuwuc. Until the supervisor
+#   gains the city.toml fallback, the operational fix is to materialize
+#   `dolt.host`/`dolt.port` from `city.toml [dolt]` directly into each
+#   inheriting rig's config.yaml so both places agree.
+#
+# What this helper does:
+#   For each city root (defaults: every $HOME/<dir> with a city.toml +
+#   .gc/system/packs):
+#     - Parse `city.toml` for the `[dolt]` block (host, port).
+#     - If absent, skip the city (no inheritance source available).
+#     - Walk every rig listed in `gc config show` ([[rigs]] entries).
+#     - For each rig whose `.beads/config.yaml` has
+#       `gc.endpoint_origin: inherited_city` AND lacks a `dolt.host:` or
+#       `dolt.port:` line, append the missing keys with values from the
+#       city's [dolt] block.
+#     - Leave files alone if both keys are already present (idempotent).
+#     - Leave files alone if origin is anything other than `inherited_city`
+#       (e.g. `city_canonical`, `explicit`).
+#
+# Pair with `gc-rig-join` for new adoptions and run after `gc-rig-init` /
+# `gc rig add --adopt` to repair the post-adopt state on cities whose
+# city.toml has an explicit `[dolt]` block.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-fix-inherited-city-resolution — materialize dolt.host/port into rigs that
+use gc.endpoint_origin: inherited_city, working around the gc binary's
+missing city.toml fallback.
+
+Usage:
+  gc-fix-inherited-city-resolution [options] [city-root ...]
+
+Default scan: every $HOME/<city> that has both city.toml and
+.gc/system/packs/. Pass explicit city-root paths as positional args to
+override discovery.
+
+Options:
+  --dry-run     Show what would change; touch nothing.
+  -h, --help    Show this help.
+
+Examples:
+  gc-fix-inherited-city-resolution                      # scan ~/* and patch every city
+  gc-fix-inherited-city-resolution --dry-run            # preview without writing
+  gc-fix-inherited-city-resolution ~/yggdrasil ~/asgard # explicit roots
+EOF
+}
+
+DRY_RUN=0
+ROOTS=()
+
+die() { echo "gc-fix-inherited-city-resolution: $*" >&2; exit 1; }
+warn() { echo "gc-fix-inherited-city-resolution: warning: $*" >&2; }
+log() { echo "$*"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done ;;
+        -*) die "unknown option: $1" ;;
+        *) ROOTS+=("$1"); shift ;;
+    esac
+done
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+    for d in "$HOME"/*; do
+        [ -d "$d/.gc/system/packs" ] && [ -f "$d/city.toml" ] && ROOTS+=("$d")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || die "no city roots with city.toml + .gc/system/packs/ found under $HOME/*; pass an explicit city root"
+fi
+
+# Parse [dolt] block from a city.toml. Echoes "host\tport" on success;
+# echoes nothing if the block is absent or incomplete. Awk handles
+# both quoted and bare values, ignores commented lines, and stops at
+# the next top-level `[section]` header.
+parse_city_dolt() {
+    local city_toml="$1"
+    [ -f "$city_toml" ] || return 0
+    awk '
+        /^\[/ {
+            if ($0 == "[dolt]") { in_dolt = 1; next }
+            in_dolt = 0
+            next
+        }
+        in_dolt && /^[[:space:]]*#/ { next }
+        in_dolt && /^[[:space:]]*host[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/^"|"$/, "")
+            host = $0
+        }
+        in_dolt && /^[[:space:]]*port[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/^"|"$/, "")
+            port = $0
+        }
+        END {
+            if (host != "" && port != "") printf "%s\t%s\n", host, port
+        }
+    ' "$city_toml"
+}
+
+# Walk rig entries and emit "name\tpath" pairs. Prefers the resolved
+# view from `gc --city <root> config show` ([[rigs]] entries — includes
+# imports and overrides) and falls back to parsing the on-disk
+# `<root>/.gc/site.toml` ([[rig]] entries — works without a working
+# gc binary or registered city, useful for hand-provisioned setups and
+# tests). Mirrors gc-rig-init's parser shape.
+#
+# The explicit --city flag is required for the gc path: gc's default
+# "walk up from cwd" actually resolves to the currently-registered city,
+# not the one matching cwd, so cd'ing into a sibling city's root would
+# still return the registered city's rigs.
+list_rigs_in_city() {
+    local city_root="$1"
+    local resolved=""
+    if command -v gc >/dev/null 2>&1; then
+        resolved=$(gc --city "$city_root" config show 2>/dev/null | awk '
+            /^\[\[rigs\]\]/ { in_rigs = 1; name = ""; path = ""; next }
+            /^\[/ && !/^\[rigs\./ { in_rigs = 0; next }
+            !in_rigs { next }
+            /^name[[:space:]]*=/ {
+                sub(/^[^=]*=[[:space:]]*/, "")
+                gsub(/^"|"$/, "")
+                name = $0
+            }
+            /^path[[:space:]]*=/ {
+                sub(/^[^=]*=[[:space:]]*/, "")
+                gsub(/^"|"$/, "")
+                path = $0
+                if (name != "" && path != "") printf "%s\t%s\n", name, path
+                name = ""; path = ""
+            }
+        ' || true)
+    fi
+    if [ -n "$resolved" ]; then
+        printf '%s\n' "$resolved"
+        return 0
+    fi
+    local site_toml="$city_root/.gc/site.toml"
+    [ -f "$site_toml" ] || return 0
+    awk '
+        /^\[\[rig\]\]/ { in_rig = 1; name = ""; path = ""; next }
+        /^\[/ { in_rig = 0; next }
+        !in_rig { next }
+        /^name[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/^"|"$/, "")
+            name = $0
+        }
+        /^path[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/^"|"$/, "")
+            path = $0
+            if (name != "" && path != "") printf "%s\t%s\n", name, path
+            name = ""; path = ""
+        }
+    ' "$site_toml"
+}
+
+# Patch a single rig's .beads/config.yaml. Returns 0 if patched, 1 if
+# already correct, 2 if skipped (origin not inherited_city, or file
+# absent), 3 if dry-run pending. Prints a one-line status to stdout.
+patch_rig_config() {
+    local rig_name="$1" rig_path="$2" host="$3" port="$4"
+    local cfg="$rig_path/.beads/config.yaml"
+    if [ ! -f "$cfg" ]; then
+        printf '    skip %s: no .beads/config.yaml\n' "$rig_name"
+        return 2
+    fi
+    # Inheritance check: only act when origin is exactly inherited_city.
+    if ! grep -qE '^gc\.endpoint_origin:[[:space:]]*inherited_city[[:space:]]*$' "$cfg"; then
+        printf '    skip %s: gc.endpoint_origin != inherited_city\n' "$rig_name"
+        return 2
+    fi
+    local has_host=0 has_port=0
+    grep -qE '^dolt\.host:[[:space:]]*[^[:space:]].*$' "$cfg" && has_host=1
+    grep -qE '^dolt\.port:[[:space:]]*[^[:space:]].*$' "$cfg" && has_port=1
+    if [ "$has_host" -eq 1 ] && [ "$has_port" -eq 1 ]; then
+        printf '    ok (already fixed) %s\n' "$rig_name"
+        return 1
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        local missing=""
+        [ "$has_host" -eq 0 ] && missing="dolt.host"
+        [ "$has_port" -eq 0 ] && missing="${missing:+$missing,}dolt.port"
+        printf '    would fix %s: append %s (host=%s port=%s)\n' \
+            "$rig_name" "$missing" "$host" "$port"
+        return 3
+    fi
+    # Append the missing keys. Ensure the file ends with a newline before
+    # appending so we don't glue onto a non-terminated final line.
+    if [ -n "$(tail -c 1 "$cfg")" ]; then
+        printf '\n' >> "$cfg"
+    fi
+    local appended=""
+    if [ "$has_host" -eq 0 ]; then
+        printf 'dolt.host: %s\n' "$host" >> "$cfg"
+        appended="dolt.host=$host"
+    fi
+    if [ "$has_port" -eq 0 ]; then
+        printf 'dolt.port: %s\n' "$port" >> "$cfg"
+        appended="${appended:+$appended,}dolt.port=$port"
+    fi
+    printf '    fixed %s: appended %s\n' "$rig_name" "$appended"
+    return 0
+}
+
+total_cities=0
+total_skipped_no_dolt=0
+total_rigs_scanned=0
+total_fixed=0
+total_already=0
+total_skipped=0
+total_pending=0
+
+for city in "${ROOTS[@]}"; do
+    total_cities=$((total_cities + 1))
+    city_toml="$city/city.toml"
+    log "city: $city"
+    if [ ! -f "$city_toml" ]; then
+        log "  skip: no city.toml at $city_toml"
+        total_skipped_no_dolt=$((total_skipped_no_dolt + 1))
+        continue
+    fi
+    dolt_pair=$(parse_city_dolt "$city_toml")
+    if [ -z "$dolt_pair" ]; then
+        log "  skip: city.toml has no [dolt] block with both host and port (no inheritance source)"
+        total_skipped_no_dolt=$((total_skipped_no_dolt + 1))
+        continue
+    fi
+    host="${dolt_pair%$'\t'*}"
+    port="${dolt_pair##*$'\t'}"
+    log "  [dolt] host=$host port=$port"
+    rigs_output=$(list_rigs_in_city "$city" 2>/dev/null || true)
+    if [ -z "$rigs_output" ]; then
+        log "  no rigs registered"
+        continue
+    fi
+    while IFS=$'\t' read -r name path; do
+        [ -n "$name" ] && [ -n "$path" ] || continue
+        total_rigs_scanned=$((total_rigs_scanned + 1))
+        set +e
+        patch_rig_config "$name" "$path" "$host" "$port"
+        rc=$?
+        set -e
+        case "$rc" in
+            0) total_fixed=$((total_fixed + 1)) ;;
+            1) total_already=$((total_already + 1)) ;;
+            2) total_skipped=$((total_skipped + 1)) ;;
+            3) total_pending=$((total_pending + 1)) ;;
+        esac
+    done <<< "$rigs_output"
+done
+
+log ""
+log "summary:"
+log "  cities scanned:        $total_cities"
+log "  cities skipped (no [dolt]): $total_skipped_no_dolt"
+log "  rigs scanned:          $total_rigs_scanned"
+log "  rigs fixed:            $total_fixed"
+log "  rigs already fixed:    $total_already"
+log "  rigs skipped:          $total_skipped"
+if [ "$DRY_RUN" -eq 1 ]; then
+    log "  rigs pending (dry-run): $total_pending"
+fi

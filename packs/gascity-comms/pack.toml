@@ -76,6 +76,17 @@
 #       See dv-gascity-utils/docs/known-binary-bugs.md
 #       "gc bd update from outside rig dir misses freshly-created
 #        cross-rig beads".
+#   - gc-fix-inherited-city-resolution, the rig endpoint inheritance fix:
+#       - The supervisor's bead-store init validator refuses any rig
+#         whose `.beads/config.yaml` has `gc.endpoint_origin: inherited_city`
+#         but lacks `dolt.host`/`dolt.port`, even when the parent
+#         `city.toml [dolt]` block has them. The field name implies
+#         inheritance but the binary doesn't fall back.
+#       - Walks each city under $HOME (or explicit roots), reads
+#         `city.toml [dolt]`, and appends `dolt.host`/`dolt.port` into
+#         every inheriting rig that's missing them. Idempotent.
+#       See dv-gascity-utils/docs/known-binary-bugs.md
+#       "inherited_city endpoint origin fails to fall back to city.toml [dolt]".
 #
 # Per-host setup (after import is materialized):
 #   1. Symlink the wrappers:

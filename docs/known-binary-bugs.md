@@ -335,6 +335,52 @@ The wrapper:
 
 ---
 
+## inherited_city endpoint origin fails to fall back to city.toml [dolt]
+
+**Trackers**: GitHub `DataViking-Tech/dv-gascity-utils#30`, bead `dgu-kuwuc`.
+
+**Symptom**: a rig's `.beads/config.yaml` has `gc.endpoint_origin: inherited_city` and the parent `city.toml` has a populated `[dolt]` block (host, port). The supervisor refuses the rig at startup with:
+
+```
+gc supervisor: city '<name>': init: beads lifecycle:
+  invalid canonical rig endpoint state in <rig>/.beads/config.yaml:
+  canonical inherited rig config requires both dolt.host and dolt.port (skipping)
+```
+
+The field name `inherited_city` implies "inherit from the city" but the validator does not walk up to `city.toml [dolt]`; it requires both keys to be present in the rig's own `config.yaml`.
+
+**Evidence**: midgard, 2026-05-02, after `gc rig add --adopt` on a rig joined from a sibling city. `city.toml [dolt]` had host/port populated; the rig's `config.yaml` had only `gc.endpoint_origin: inherited_city` plus `gc.endpoint_status`.
+
+Two paths hit this in practice:
+1. `gc rig add --adopt` writes `config.yaml` without `dolt.host`/`dolt.port` (the values are inherited at the gc-CLI layer; the supervisor validator does not).
+2. Pre-staged `.beads/` stubs from `gc-rig-join` + `gc dolt-state ensure-project-id` likewise start without explicit host/port.
+
+**Why no Class A**: the validator runs inside the supervisor process at every reload; there is no host-side config knob that disables the requirement or wires the fallback.
+
+**Workaround (Class B)**: `gc-fix-inherited-city-resolution` materializes `dolt.host` and `dolt.port` from each city's `city.toml [dolt]` block into every rig whose `config.yaml` has `gc.endpoint_origin: inherited_city` and lacks the explicit fields. Idempotent — files with both keys already present are skipped, as are rigs whose origin is anything other than `inherited_city` (e.g. `city_canonical`, `explicit`).
+
+```bash
+ln -sf ~/dv-gascity-utils/packs/gascity-comms/assets/scripts/gc-fix-inherited-city-resolution \
+    ~/.gc/bin/gc-fix-inherited-city-resolution
+
+# Patch every city under $HOME (default discovery)
+gc-fix-inherited-city-resolution
+
+# Preview without writing
+gc-fix-inherited-city-resolution --dry-run
+
+# Explicit roots
+gc-fix-inherited-city-resolution ~/yggdrasil ~/asgard
+```
+
+Cities whose `city.toml` has no `[dolt]` block (i.e. relying on the dolt-pack's local default) are skipped — there is no inheritance source to read from, and these cities are not affected by the bug in practice.
+
+`gc-city-bootstrap` symlinks `gc-fix-inherited-city-resolution` automatically and runs it once during step 7. Re-run after every `gc rig add --adopt` until the binary gains the city.toml fallback.
+
+**Test plan** (after the binary is fixed upstream): create a rig with `.beads/config.yaml` containing only `gc.endpoint_origin: inherited_city` (no explicit host/port), populate `city.toml [dolt]`, and verify the supervisor accepts the rig at reload without the helper having been run.
+
+---
+
 ## jsonl-export.sh column rename type → issue_type
 
 **Trackers**: `mg-yras` (closed — workaround applied).
