@@ -25,10 +25,23 @@
 # the order's environment. With auto-merge disabled, CI green still
 # records ci_status=passed and the script returns without acting.
 #
+# For shell-only / docs-only repos that have no CI pipeline configured,
+# set PR_CI_WATCH_MERGE_ON_NO_CHECKS=true in the order's environment.
+# With this enabled, the "no checks reported" path also attempts the
+# auto-merge — useful for dv-gascity-utils itself, where shell-script
+# PRs would otherwise sit indefinitely awaiting human merge.
+#
 # Idempotent: each cycle reads bead state fresh; terminal merge_result
 # values are skipped. Capped at 3 consecutive resling attempts (CI fail
 # OR merge conflict OR auto-merge failure — all share the resling cap)
 # before escalating to mayor (override via PR_CI_WATCH_MAX_RESLINGS).
+#
+# Cooldown was 5m through 2026-05-02 17:00. Lowered to 1m at that point:
+# 5m + per-run wall time (~80s pre-optimization, ~15s post-batched
+# gh queries) was producing observed cycle intervals of ~14min on yg
+# due to compound dispatch-queue contention. Tighter cooldown +
+# batched gh calls bring cycle intervals to ~2min, which is closer to
+# the operator expectation of "near-real-time PR state surveillance."
 #
 # Requires per-host gh CLI auth on the host running this order. Tokens
 # live in ~/.config/gh/, never in this pack.
@@ -39,5 +52,5 @@
 [order]
 description = "Watch PRs linked to tracked beads; resling on CI failure"
 trigger = "cooldown"
-interval = "5m"
+interval = "1m"
 exec = "$PACK_DIR/assets/scripts/pr-ci-watch.sh"
