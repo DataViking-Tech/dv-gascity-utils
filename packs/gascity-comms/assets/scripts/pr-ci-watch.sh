@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # pr-ci-watch.sh — watch open PRs linked to tracked beads, auto-merge on
 # green CI, and resling on failure paths. Runs from a cooldown order
-# every ~5 min.
+# every ~1 min (tightened from 5m on 2026-05-02; see pr-ci-watch.toml
+# for the rationale).
 #
 # Two bead populations are tracked:
 #
@@ -23,10 +24,11 @@
 #       CI pending      -> no-op this cycle
 #       MERGEABLE=CONFLICTING -> resling (merge conflict on target)
 #       CI all-pass + mergeable -> attempt `gh pr merge --squash --delete-branch`
-#         success      -> set merge_result=merged_external on next cycle
-#                          via the MERGED state branch
-#         failure      -> resling (treated as a merge conflict surfaced
-#                          at merge time)
+#       no checks reported -> if PR_CI_WATCH_MERGE_ON_NO_CHECKS=true,
+#                            attempt the merge anyway (useful for
+#                            shell-only / docs-only repos like
+#                            dv-gascity-utils itself); otherwise record
+#                            ci_status=no_checks and return.
 #
 # Resling shape (single path, called from any of the failure branches
 # above):
@@ -49,6 +51,17 @@
 # auto-merge disabled, CI green still records ci_status=passed and the
 # script returns without acting (existing pre-2026-05-01 behavior).
 #
+# Auto-merge on no-checks: opt-in via PR_CI_WATCH_MERGE_ON_NO_CHECKS=true.
+# Necessary for shell/docs-only repos with no CI pipeline configured —
+# without it, those PRs sit indefinitely awaiting human merge.
+#
+# Performance: gh API queries are batched once per cycle via a single
+# `gh pr list --json url,state,mergeable,statusCheckRollup` call per
+# distinct repo, then looked up by URL per bead. Earlier per-bead
+# `gh pr view` + `gh pr checks` (2 calls × ~500ms each per bead)
+# produced ~80s wall time on yg with 5 tracked beads; batched form
+# runs in ~5–15s independent of bead count.
+#
 # Idempotent. Terminal merge_result values are skipped. Each cycle is a
 # self-contained pass.
 #
@@ -58,6 +71,15 @@ set -euo pipefail
 
 MAX_RESLINGS="${PR_CI_WATCH_MAX_RESLINGS:-3}"
 AUTO_MERGE="${PR_CI_WATCH_AUTO_MERGE:-true}"
+MERGE_ON_NO_CHECKS="${PR_CI_WATCH_MERGE_ON_NO_CHECKS:-false}"
+
+# Per-cycle cache: each line is "<pr_url>\t<json>". Looked up by grep
+# on URL prefix. Same string-table convention as RIG_TABLE — keeps
+# the script compatible with macOS bash 3.2 (no associative arrays).
+PR_CACHE=""
+# Tab-delimited list of repo slugs already pre-fetched (avoid
+# re-listing if a single rig has multiple beads in the same repo).
+REPO_FETCHED=""
 
 if ! command -v gh >/dev/null 2>&1; then
     exit 0
@@ -172,35 +194,89 @@ discover_pr_url() {
     printf '%s' "$res" | jq -r '.[0].url // empty'
 }
 
-# pr_info <pr_url> -> stdout: JSON {state, mergedAt, mergeCommit, closed, mergeable}
+# fetch_open_prs_for_repo <slug>
+# Pre-fetches state for every open PR in the repo with a single gh
+# call and caches by URL. Subsequent pr_info/checks_summary calls hit
+# the cache instead of doing per-bead gh API round-trips. ~5–15s per
+# unique repo regardless of bead count, vs. ~1s per bead pre-batch.
+fetch_open_prs_for_repo() {
+    local slug="$1"
+    [[ -z "$slug" ]] && return 0
+    # Already fetched? (search REPO_FETCHED for a tab-bounded match.)
+    case "$REPO_FETCHED" in
+        *"	${slug}	"*) return 0 ;;
+    esac
+    REPO_FETCHED="${REPO_FETCHED}	${slug}	"
+    local out
+    out=$(gh pr list --repo "$slug" --state open --limit 0 \
+        --json url,state,mergedAt,mergeCommit,closed,mergeable,statusCheckRollup \
+        2>/dev/null || echo "[]")
+    [[ -z "$out" || "$out" == "[]" ]] && return 0
+    # Walk the array and append each entry to PR_CACHE as
+    # "<url>\t<json>\n". Lookup via awk in pr_info.
+    local urls entry
+    urls=$(printf '%s' "$out" | jq -r '.[].url // empty')
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        entry=$(printf '%s' "$out" | jq -c --arg u "$url" '.[] | select(.url == $u)')
+        [[ -n "$entry" ]] && PR_CACHE="${PR_CACHE}${url}	${entry}
+"
+    done <<< "$urls"
+}
+
+# pr_info <pr_url> -> stdout: JSON {state, mergedAt, mergeCommit, closed, mergeable, statusCheckRollup}
 # mergeable values returned by gh: MERGEABLE | CONFLICTING | UNKNOWN
+# Cached path: hits PR_CACHE if pre-fetched. Fallback path: per-PR gh
+# pr view (used for closed/merged PRs that won't appear in --state open).
 pr_info() {
     local pr_url="$1"
-    gh pr view "$pr_url" --json state,mergedAt,mergeCommit,closed,mergeable 2>/dev/null || echo "{}"
+    local cached
+    cached=$(printf '%s' "$PR_CACHE" | awk -F'\t' -v u="$pr_url" '$1 == u { print $2; exit }')
+    if [[ -n "$cached" ]]; then
+        printf '%s' "$cached"
+        return
+    fi
+    gh pr view "$pr_url" --json state,mergedAt,mergeCommit,closed,mergeable,statusCheckRollup 2>/dev/null || echo "{}"
 }
+
+# bucket_from_check_entry — given a single statusCheckRollup entry
+# (JSON object), return one of: pass | fail | pending. The rollup
+# shape varies — status checks have .state, check runs have
+# .conclusion + .status. Coalesce both into a single bucket.
+#
+# Used by checks_summary (which counts) and failing_checks_brief
+# (which lists names).
+read -r -d '' BUCKET_JQ <<'JQEOF' || true
+def bucket:
+    (.conclusion // .state // "") as $c
+    | (.status // "") as $s
+    | if $c == "SUCCESS" then "pass"
+      elif $c == "FAILURE" or $c == "CANCELLED" or $c == "TIMED_OUT" or $c == "ACTION_REQUIRED" then "fail"
+      elif $c == "PENDING" or $c == "" or $s == "IN_PROGRESS" or $s == "QUEUED" then "pending"
+      else "pass"
+      end;
+JQEOF
 
 # checks_summary <pr_url> -> stdout: pass | fail | pending | none | error
 checks_summary() {
     local pr_url="$1"
-    local out
-    # gh pr checks exits 8 when checks are pending; JSON still emitted.
-    out=$(gh pr checks "$pr_url" --json bucket 2>/dev/null || true)
-    [[ -z "$out" ]] && { printf 'error'; return; }
+    local info rollup
+    info=$(pr_info "$pr_url")
+    [[ -z "$info" || "$info" == "{}" ]] && { printf 'error'; return; }
+    rollup=$(printf '%s' "$info" | jq -c '.statusCheckRollup // []' 2>/dev/null || echo '[]')
 
     local n_total n_fail n_pending
-    n_total=$(printf '%s' "$out" | jq 'length' 2>/dev/null || echo 0)
+    n_total=$(printf '%s' "$rollup" | jq 'length' 2>/dev/null || echo 0)
     [[ "$n_total" -eq 0 ]] && { printf 'none'; return; }
 
-    n_fail=$(printf '%s' "$out" \
-        | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length' \
-        2>/dev/null || echo 0)
-    n_pending=$(printf '%s' "$out" \
-        | jq '[.[] | select(.bucket == "pending")] | length' \
-        2>/dev/null || echo 0)
+    local buckets
+    buckets=$(printf '%s' "$rollup" | jq -r "$BUCKET_JQ"' .[] | bucket' 2>/dev/null || echo "")
+    n_fail=$(printf '%s\n' "$buckets" | grep -cx 'fail' || true)
+    n_pending=$(printf '%s\n' "$buckets" | grep -cx 'pending' || true)
 
-    if [[ "$n_fail" -gt 0 ]]; then
+    if [[ "${n_fail:-0}" -gt 0 ]]; then
         printf 'fail'
-    elif [[ "$n_pending" -gt 0 ]]; then
+    elif [[ "${n_pending:-0}" -gt 0 ]]; then
         printf 'pending'
     else
         printf 'pass'
@@ -210,8 +286,12 @@ checks_summary() {
 # failing_checks_brief <pr_url> -> stdout: comma-separated failing names.
 failing_checks_brief() {
     local pr_url="$1"
-    gh pr checks "$pr_url" --json bucket,name 2>/dev/null \
-        | jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | unique | join(", ")' \
+    local info rollup
+    info=$(pr_info "$pr_url")
+    [[ -z "$info" || "$info" == "{}" ]] && return 0
+    rollup=$(printf '%s' "$info" | jq -c '.statusCheckRollup // []' 2>/dev/null || echo '[]')
+    printf '%s' "$rollup" \
+        | jq -r "$BUCKET_JQ"' [.[] | select(bucket == "fail") | (.name // "unknown")] | unique | join(", ")' \
         2>/dev/null || true
 }
 
@@ -302,6 +382,16 @@ process_bead() {
         bd update "$bead_id" --set-metadata pr_url="$pr_url" >/dev/null 2>&1 || true
     fi
 
+    # Pre-fetch every open PR in this rig's repo on first encounter
+    # (cached per-cycle in PR_CACHE / REPO_FETCHED). Subsequent beads
+    # in the same repo skip the gh API round-trip entirely.
+    local origin_url repo_slug
+    origin_url=$(git -C "$rig_path" remote get-url origin 2>/dev/null || true)
+    if [[ -n "$origin_url" ]]; then
+        repo_slug=$(parse_repo_slug "$origin_url")
+        [[ -n "$repo_slug" ]] && fetch_open_prs_for_repo "$repo_slug"
+    fi
+
     local info state merged_at merge_sha mergeable
     info=$(pr_info "$pr_url")
     [[ -z "$info" || "$info" == "{}" ]] && return 0
@@ -390,6 +480,34 @@ process_bead() {
             ;;
         none)
             bd update "$bead_id" --set-metadata ci_status=no_checks >/dev/null 2>&1 || true
+            # When PR_CI_WATCH_MERGE_ON_NO_CHECKS=true (host opt-in for
+            # shell/docs-only repos with no CI pipeline), attempt the
+            # auto-merge anyway. Same shape as the pass-path branch.
+            if [[ "$MERGE_ON_NO_CHECKS" == "true" ]]; then
+                local merge_result_nc
+                merge_result_nc=$(attempt_auto_merge "$pr_url")
+                case "$merge_result_nc" in
+                    ok)
+                        bd update "$bead_id" \
+                            --append-notes "pr-ci-watch: no CI checks; auto-merged per PR_CI_WATCH_MERGE_ON_NO_CHECKS=true." \
+                            >/dev/null 2>&1 || true
+                        return 0
+                        ;;
+                    conflict)
+                        if [[ "$resling_count" -ge "$MAX_RESLINGS" ]]; then
+                            escalate_cap_reached "$bead_id" "$pr_url" "$resling_count"
+                            return 0
+                        fi
+                        resling_bead "$bead_id" "$rig" "$pr_url" \
+                            "Merge conflict at no-checks auto-merge (PR_CI_WATCH_MERGE_ON_NO_CHECKS=true)" \
+                            "$resling_count"
+                        return 0
+                        ;;
+                    skipped)
+                        return 0
+                        ;;
+                esac
+            fi
             return 0
             ;;
         pending|error)
