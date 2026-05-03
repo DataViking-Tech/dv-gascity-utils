@@ -125,6 +125,7 @@ HELPERS=(
     "gc-warm-rig-pool"
     "gc-tune-refinery-loop"
     "gc-fix-refinery-routing"
+    "gc-bd"
     "gc-city-bootstrap"
 )
 for h in "${HELPERS[@]}"; do

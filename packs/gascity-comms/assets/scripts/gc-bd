@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# gc-bd — drop-in wrapper around `gc bd <subcommand> <id> ...` that
+# auto-derives `--rig <name>` from the bead-id prefix so cross-rig
+# bead operations resolve from any working directory.
+#
+# WHY this exists:
+#   The gc binary's bd-id resolver uses a local routing cache that
+#   goes stale between `bd create` and the next read. A bead created
+#   against one rig isn't visible to `bd update <id>` from a working
+#   directory outside that rig until the cache rebuilds. Passing
+#   `--rig <name>` makes the resolver consult shared dolt directly,
+#   sidestepping the cache.
+#
+#   Slinging a freshly-created bead to a polecat pool is a two-step
+#   flow: `bd create --rig <r>` then `bd update <id> --set-metadata`.
+#   The second step needs the rig name even though the prefix on the
+#   id already pins the rig. This wrapper derives `--rig` from the
+#   prefix and injects it.
+#
+#   See docs/known-binary-bugs.md
+#   "gc bd update from outside rig dir misses freshly-created
+#    cross-rig beads".
+#
+# BEHAVIOR:
+#   - For subcommands that take a bead-id positional argument (update,
+#     show, close, reopen, comment, comments, note, edit, assign,
+#     priority, set-state, label, link, delete, promote, children),
+#     parse the first id-shaped positional arg, derive its prefix,
+#     look up the rig name via `gc rig list --json`, and inject
+#     `--rig <name>` at the gc top-level position.
+#   - If `--rig` is already present in the args, fall through unchanged.
+#   - If the id has no recognizable prefix, or the prefix doesn't
+#     match any known rig, fall through unchanged so the underlying
+#     gc command produces its native error.
+#   - For all other subcommands (list, ready, stats, search, query,
+#     create, q, gate, merge-slot, ...), fall through unchanged.
+#   - Always exec — preserves stdin (description piping), exit code,
+#     and signal handling.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+gc-bd — `gc bd` wrapper that auto-injects --rig from bead-id prefix.
+
+Usage:
+  gc-bd <subcommand> [args...]
+
+Examples:
+  gc-bd update dgu-al90e --set-metadata gc.routed_to=dv-gascity-utils/polecat
+  gc-bd show dgu-al90e
+  gc-bd close dgu-al90e
+
+For any subcommand or arg shape gc-bd doesn't recognize, falls through
+to plain `gc bd ...` unchanged.
+
+Workaround for the gc binary's stale bd-id routing cache. See
+docs/known-binary-bugs.md "gc bd update from outside rig dir misses
+freshly-created cross-rig beads".
+EOF
+}
+
+# Subcommands that take a bead-id positional arg right after the
+# subcommand and benefit from rig injection.
+ID_SUBCOMMANDS=(
+    update show close reopen comment comments note edit
+    assign priority set-state label link delete promote children
+)
+
+is_id_subcommand() {
+    local sub="$1"
+    for s in "${ID_SUBCOMMANDS[@]}"; do
+        [ "$s" = "$sub" ] && return 0
+    done
+    return 1
+}
+
+# Match `<prefix>-<suffix>` where prefix is 1-5 lowercase letters and
+# suffix is alphanumeric. Covers every gc bead id (yg, dgu, sp, tr,
+# mg, ds, tc, ... plus the 4-6 char suffix from the bd id allocator).
+looks_like_bead_id() {
+    [[ "$1" =~ ^[a-z]{1,5}-[a-z0-9]+$ ]]
+}
+
+prefix_of() {
+    printf '%s' "${1%%-*}"
+}
+
+# Resolve a prefix to a rig name via `gc rig list --json`. Empty
+# string on miss, on JSON parse failure, or on `gc rig list` error.
+# Filters out the HQ rig — gc rejects `--rig <hq-name>` ("rig
+# not found") and resolves HQ beads by default anyway, so injecting
+# would break the call.
+rig_name_for_prefix() {
+    local prefix="$1"
+    gc rig list --json 2>/dev/null \
+        | jq -r --arg p "$prefix" \
+            '.rigs[] | select(.prefix == $p) | select(.hq != true) | .name' \
+            2>/dev/null \
+        | head -n1
+}
+
+case "${1:-}" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    "")
+        usage
+        exit 2
+        ;;
+esac
+
+# If the caller already passed --rig anywhere, honor it and fall through.
+for arg in "$@"; do
+    case "$arg" in
+        --rig|--rig=*)
+            exec gc bd "$@"
+            ;;
+    esac
+done
+
+sub="$1"
+
+# Only id-bearing subcommands need rig injection.
+if ! is_id_subcommand "$sub"; then
+    exec gc bd "$@"
+fi
+
+# Find the first id-shaped non-flag arg after the subcommand.
+bead_id=""
+seen_sub=0
+for arg in "$@"; do
+    if [ "$seen_sub" -eq 0 ]; then
+        seen_sub=1
+        continue
+    fi
+    case "$arg" in
+        -*) continue ;;
+    esac
+    if looks_like_bead_id "$arg"; then
+        bead_id="$arg"
+        break
+    fi
+done
+
+if [ -z "$bead_id" ]; then
+    exec gc bd "$@"
+fi
+
+prefix="$(prefix_of "$bead_id")"
+rig="$(rig_name_for_prefix "$prefix" || true)"
+
+if [ -z "$rig" ]; then
+    # Unknown prefix — let gc produce its native error.
+    exec gc bd "$@"
+fi
+
+# Inject --rig at the gc top-level position. Cobra accepts global
+# flags after the subcommand too, but the canonical position is
+# before so error messages and `--help` parse cleanly.
+exec gc --rig "$rig" bd "$@"
